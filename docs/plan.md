@@ -13,7 +13,7 @@ Status: proposal. Scope: one process on one high-end workstation, demonstrating 
 7. **Scoring follows Progressive Entity Matching.** Cheap weights, then BFS scheduling under a per-second budget, then a calibrated gradient-boosted pair model. The budget, not the input rate, bounds compute.
 8. **Groups overlap, and "unassigned" is a valid state.** A trace belongs to zero, one or up to three groups. Merges and splits are recorded proposals, never transitive closure. Memberships express behavioural similarity, never identity.
 9. **Attribution is a separate layer with an explicit "unknown actor" hypothesis.** An actor is declared only when calibrated evidence from at least two independent evidence classes clears a precision-tuned threshold. LLMs may draft explanations from cited evidence; they never set scores.
-10. **Lineage is tamper-evident, not tamper-proof.** A BLAKE3 hash chain covers raw segments and every derived decision. Chain heads are signed with a key held outside the process.
+10. **Lineage is tamper-evident, not tamper-proof.** A BLAKE3 hash chain covers raw segments and every derived decision. Chain heads are signed with a key held outside the process and copied to an external append-only store, so rollback is detectable.
 
 ## 2. What we take from each source
 
@@ -72,7 +72,11 @@ flowchart LR
   LAB -.-> A
 ```
 
-**Threads.** One reader per source; a normalize/parse pool; trace assembler shards keyed by host; a feature/index worker; a scheduler/matcher pool; a single writer for group and attribution state, so group state needs no locks; a low-priority segment sealer; the API. Channels are bounded. Under overload the matching budget shrinks first. Raw events are never dropped, because the WAL write precedes everything else.
+**Threads.** One reader per source; a normalize/parse pool; trace assembler shards keyed by host; a feature/index worker; a scheduler/matcher pool; a single writer for group and attribution state, so group state needs no locks; a low-priority segment sealer; the API. Channels are bounded. Under overload the matching budget shrinks first.
+
+**Ordering.** Each reader stamps a per-source sequence number before the parse pool. A per-host reorder buffer releases events to the assembler in (event time, source, sequence) order once a watermark passes (start with 5 s allowed lateness). Later arrivals are applied as versioned corrections to the affected trace, never silently reordered. This keeps shingles, inter-arrival features and process ancestry the same between live runs and replay.
+
+**Loss guarantee.** No event is lost once it is appended to the WAL, because the WAL write precedes all other processing. Before that point the guarantee depends on the source. File tails and queue consumers resume from committed offsets, and agents must buffer until acknowledged, so bounded channels only add backpressure. Sources that cannot be paused (UDP syslog, NetFlow) get a dedicated receive thread with a large ring buffer. Drops are counted per source and reported, never hidden.
 
 **Core records.**
 
@@ -92,7 +96,7 @@ flowchart LR
 
 - Phase 1 inputs: DARPA CDM (via PIDSMaker converters), OpTC eCAR, Sysmon/EDR JSON, auditd, Zeek conn/dns/http/ssl, and CTA command JSON, all normalized to the Event schema.
 - Raw bytes are appended to 256 MB zstd WAL segments with a per-record BLAKE3 hash. Each segment's Merkle root is chained to the previous root.
-- An online template parser (Drain-style fixed-depth tree) runs at ingest, with LogGrep-style refinement when a segment is sealed. Its output is a template ID plus typed variables.
+- An online template parser (Drain-style fixed-depth tree) runs at ingest. Its output is a template ID plus typed variables. Ingest-time template IDs are immutable and are the only IDs that features and indexes use. LogGrep-style refinement at seal time writes a separate `refined_template_id` column used only for compression and search. A refined vocabulary reaches the features only through a new model version, which re-featurizes recorded traces and is logged in the ledger.
 - Segments are sealed hourly (or at 256 MB) into Parquet with dictionary-encoded `template_id`, typed variable columns and `event_hash`. A rottnest LogCloud index is built per sealed segment. DataFusion runs aggregation queries across segments.
 - Hot state lives in RocksDB: entities, open traces, the DynaHash DB and indicator postings.
 - Baselines to beat: zstd JSON plus ripgrep for search; DuckDB over untemplated Parquet for aggregation.
@@ -109,7 +113,7 @@ Relations between traces (spawned-by, same process, connected-to via host + 5-tu
 Features, all mergeable and updated per event:
 - **Token stream:** template IDs, SCLC-normalized commands, or (action, object class) tokens; ThreatTrace compaction applied at seal.
 - **Shingle set:** 1–3-grams of tokens plus ATT&CK technique IDs from rules or tags, sketched with 128 MinHash functions.
-- **Pooled vector:** `[log n, mean, std, min, max]` of 64-d word2vec token vectors trained offline per modality. 257 dimensions, L2-normalized, int8-quantized for indexing.
+- **Pooled vector:** `[log n, mean, std, min, max]` of 64-d word2vec token vectors trained offline per modality. 257 dimensions, L2-normalized, int8-quantized for indexing. Each modality's vectors live in their own embedding space, so they are indexed and compared only within that modality (§4.3).
 - **Timing:** log2 inter-arrival histogram (8 bins), duration, burstiness.
 - **Indicators:** file hashes, domains, IPs, ports, JA3/JA4, user agents, named pipes, service names, as exact keys. An IDF floor drops keys present in more than 0.1% of traces.
 - **Anomaly:** maximum and mean VELOX loss over member events.
@@ -119,20 +123,20 @@ Phase 3 option: a MIL aggregator (instance MLP, time-gap encoding, gated attenti
 ### 4.3 Retrieve a small candidate set (DynaHash, BlockingPy)
 
 - **LSH:** DynaHash Hamming-LSH on the MinHash vectors. Start from the paper's settings (θ=0.5, δ=0.1, k=6 for DB, φ=4 and w=500 for T, multi-probe ω=1) and re-tune k by sampled query time, as the paper does. T answers within the latency budget; DB is consulted for high-anomaly traces and audits.
-- **ANN:** HNSW (usearch) over pooled vectors: cosine, int8, M=32, ef_search=64, k=20, incremental inserts.
+- **ANN:** one HNSW index (usearch) per modality over pooled vectors: cosine, int8, M=32, ef_search=64, k=20, incremental inserts. Cross-modality candidates come only from modality-independent signals: provenance and causal joins, shared indicators, and technique sets. A learned cross-modal projection is a Phase 3 option under the same adoption rule as the MIL aggregator.
 - **Indicators:** capped RocksDB posting lists.
-- **Group prototypes:** a small separate HNSW over group centroids, k=10.
+- **Group prototypes:** a small separate HNSW per modality over group centroids, computed from that modality's members, k=10.
 - **Union:** deduplicate and cap at 50 trace candidates plus 10 groups per query.
 - **Offline:** BlockingPy runs the same corpora through faiss, hnsw, nnd and annoy to pick the backend and parameters by pairs completeness against reduction ratio.
 - **Baselines:** indicators only; brute-force cosine on a sample.
-- **Target:** pairs completeness ≥ 0.95 for same-campaign pairs at ≤ 50 candidates per trace.
+- **Target:** neighbour recall ≥ 0.95, stratified by campaign size, at ≤ 50 candidates per trace. When a trace is queried, m same-campaign traces are already indexed. Its true neighbours are the min(50, m) of those closest in event time, and neighbour recall is the fraction of them that appear in its candidate set. Grouping needs a connected sparse set of true links, not all n(n−1)/2 pairs. A 50-candidate cap bounds full pairs completeness at 100/(n−1), so 0.95 is unreachable for campaigns of 107 or more traces even with perfect retrieval. Full pairs completeness is still reported, but only for BlockingPy comparisons.
 
 ### 4.4 Prioritize and score candidate relationships (Progressive Entity Matching)
 
 - **Weighting:** cheap scores already computed: estimated Jaccard, cosine, indicator IDF sum, time proximity, same or adjacent host.
 - **Scheduling:** BFS. Every queued trace gets its best candidate verified before any trace gets its second. Traces are ordered by anomaly score; this ordering is our extension and is compared against plain BFS and edge-centric ordering.
 - **Matching:** a LightGBM pair model with about 25 features in six evidence classes:
-  - behaviour sequence: normalized edit distance and LCS over compacted tokens
+  - behaviour sequence: banded normalized edit distance and LCS over compacted tokens, computed on at most the first and last 256 tokens of each trace, plus MinHash-estimated Jaccard for the remainder
   - technique set: IDF-weighted Jaccard
   - tooling: software and tool tokens
   - infrastructure: shared indicators
@@ -140,7 +144,7 @@ Phase 3 option: a MIL aggregator (instance MLP, time-gap encoding, gated attenti
   - timing
 
   Isotonic calibration on held-out pairs. Per-prediction TreeSHAP contributions are stored as evidence.
-- **Budget:** a fixed number of pair verifications per second (start at 20k/s), adapted under load.
+- **Budget:** the budget counts comparison cost, not pairs. Each pair is charged its estimated work (sequence cells plus a fixed model cost) against a per-second allowance, starting at about 20k typical pairs/s and adapted under load, and each pair also has a wall-clock cap (start at 2 ms). A pair that exceeds the cap is scored without its sequence features and flagged in its evidence.
 - **Metrics:** the paper's progressive recall curve (true links found against comparisons spent) and calibration error.
 - **Baseline:** a cosine threshold alone.
 
@@ -149,8 +153,8 @@ Phase 3 option: a MIL aggregator (instance MLP, time-gap encoding, gated attenti
 Membership:
 - s(t, g) = mean of the top-3 calibrated link probabilities between trace t and members of group g, blended with prototype similarity.
 - Keep up to three memberships with s ≥ τ_m (start at 0.5). Otherwise the trace stays unassigned; it remains indexed and can join a group later.
-- Seed a new group when an unassigned pair has p ≥ τ_seed (start at 0.8) with at least two evidence classes.
-- Membership states: proposed → supported → analyst-confirmed or analyst-rejected. Analyst decisions become labelled pairs for retraining.
+- Seed a new group when a pair has p ≥ τ_seed (start at 0.8) with at least two evidence classes and the two traces share no group yet. Either trace may already belong to other groups, subject to the three-membership cap, so a trace shared by two campaigns can seed the second.
+- Membership states: proposed → supported → analyst-confirmed or analyst-rejected. Analyst membership decisions are stored as trace–group labels and used to calibrate s(t, g) and τ_m. They are never expanded into pair labels, because confirming a trace's membership in a non-transitive group does not make it a match with every member. The pair model is retrained only on pair-level labels: dataset ground truth plus explicit analyst same/different decisions on specific pairs.
 - Two groups that share strong members produce an online merge proposal. A nightly offline audit runs Leiden on the calibrated link graph and proposes splits and merges. Every change is versioned in the ledger.
 
 Explanation:
@@ -165,17 +169,21 @@ Baselines: connected components over shared indicators (the failure mode to quan
 ### 4.6 Attribute groups to known actors (behavioural models, AURA)
 
 - **Knowledge base:** MITRE ATT&CK Enterprise STIX 2.1 (groups, campaigns, software, techniques, `uses` relations), versioned by hash. Optionally a local CTI report corpus searched with BM25.
-- **Evidence scorers**, one per actor hypothesis:
-  - TTP and tools: IDF-weighted overlap between the group's techniques and tools and the actor's known set.
-  - Behaviour, for command traces: an open-set classifier with energy or max-probability rejection. Start with TF-IDF n-grams plus logistic regression; compare with the CTA hybrid model.
-  - Infrastructure: overlap with actor-linked indicators, time-decayed and given low weight.
-- **Fusion:** a sum of calibrated log-likelihood ratios, at most one term per evidence class, scored against an explicit unknown-actor hypothesis with its own prior. Weights are fit on labelled data (CTA corpus, CARBANAKv2).
-- **Decision rule:**
-  - *attributed:* posterior ≥ 0.9, at least two evidence classes, and a margin ≥ 0.3 over the runner-up
+- **Evidence classes** are defined by where the observation came from, not by which scorer read it:
+  - **Execution content:** commands, process trees and file operations. Two scorers read this source:
+    - IDF-weighted overlap of techniques and tools with each actor's known set;
+    - for command traces, an open-set classifier with energy or max-probability rejection (start with TF-IDF n-grams plus logistic regression; compare with the CTA hybrid model).
+
+    Both read the same observations, so they are stacked into one jointly calibrated score and count as one class.
+  - **Infrastructure:** network indicators such as C2 domains, IPs, certificates and JA3/JA4 fingerprints, compared with actor-linked indicators, time-decayed and given low weight.
+  - **Artifacts:** file hashes, malware family verdicts and named pipes or mutexes from file evidence.
+- **Fusion:** a sum of calibrated log-likelihood ratios, one term per evidence class, scored against an explicit unknown-actor hypothesis with its own prior. Weights are fit on labelled data (CTA corpus, CARBANAKv2).
+- **Decision rule** (posteriors are normalized over all actors plus unknown):
+  - *attributed:* posterior ≥ 0.9, at least two independent evidence classes, and the top hypothesis stays first with posterior ≥ 0.5 when any one evidence class is removed (leave-one-class-out)
   - *candidates:* top posterior ≥ 0.3
   - *unresolved:* otherwise
 
-  Thresholds are re-fit to reach ≥ 0.95 precision on time-forward held-out data, and coverage is reported alongside.
+  Thresholds are re-fit to reach ≥ 0.95 precision on time-forward held-out data, and coverage is reported alongside. Command-only traces, the CTA corpus included, supply a single evidence class, so they can reach at most *candidates*. The CTA corpus therefore evaluates ranking and calibration of the execution-content score. The *attributed* rule is evaluated on CARBANAKv2 and the composite stream, where infrastructure and artifact evidence also exist.
 - Attribution is re-evaluated on every group change, and its history is kept.
 - **LLM (optional, analyst-triggered):** drafts a justification from stored evidence records. Every cited evidence ID is checked to exist. It has no effect on scores.
 
@@ -183,8 +191,9 @@ Baselines: connected components over shared indicators (the failure mode to quan
 
 - **Raw:** per-event BLAKE3 hash, a Merkle root per segment, roots chained.
 - **Derived:** every ledger record is `hash(inputs, model hash, params hash, output, prev)`. Models, the ATT&CK bundle and configuration are content-addressed.
-- **Anchoring:** every N minutes the chain head is signed with an Ed25519 key held outside the process (TPM, HSM or a second machine), optionally with an RFC 3161 timestamp. Without external anchoring, the chain only reveals tampering by someone who cannot rewrite it end to end.
-- **Tools:** `snortd verify` recomputes the chains. `snortd replay <decision>` re-derives a decision from raw evidence and pinned model versions. This requires fixed seeds, single-writer group state and ordered inputs.
+- **Anchoring:** every N minutes the chain head is signed with an Ed25519 key held outside the process (TPM, HSM or a second machine). The signed head, its sequence number and the signature are also sent to an external append-only store: a second machine's write-once log, an RFC 3161 timestamp authority whose receipts are kept off the workstation, or a public transparency log. `verify` compares the local chain with the latest externally held head, which detects rollback, truncation and deleted suffixes. Without that external copy, an attacker who can rewrite local storage can roll back to an older validly signed head undetected. A workstation-only deployment therefore detects edits inside the chain, but not rollback.
+- **Decision context:** each ledger record also stores the mutable context the decision depended on: candidate-set IDs and their weights, the group-state version, the index snapshot epoch, the scheduler round and the budget in force, and the IDs of the verified pairs.
+- **Tools:** `snortd verify` recomputes the chains. `snortd replay <decision>` re-evaluates one decision from its recorded inputs and pinned model versions. Full-pipeline replay starts from a periodic state snapshot (indexes, groups, scheduler) and runs with a fixed budget instead of a load-adapted one. Both require fixed seeds, single-writer group state and the ordering rules in §3.
 
 ## 6. Workstation sizing and budgets
 
@@ -198,7 +207,7 @@ Reference machine: 32 cores, 256 GB ECC RAM, two 4 TB NVMe drives (one for WAL a
 | Pair verification budget | 20k/s |
 | HNSW memory | about 0.5 KB per trace (257 B int8 vector + level-0 links), about 50 GB per 100M traces |
 | Substring search over 30 days of segments | < 10 s |
-| Event loss under 2× overload | none |
+| Event loss under 2× overload | none after WAL append; zero for offset-resumable sources; counted and reported for sources that cannot be paused (§3) |
 
 ## 7. Evaluation
 
@@ -235,7 +244,7 @@ The composite stream uses OpTC benign days as background, with CTA beacon sessio
 |---|---|---|
 | 1 Ingest | events/s, bytes per event on disk, search latency, aggregation latency | zstd + ripgrep; DuckDB |
 | 2 Represent | same-campaign recall@10 | TF-IDF n-grams |
-| 3 Retrieve | pairs completeness against candidates per trace; reduction ratio; query latency | indicators only |
+| 3 Retrieve | neighbour recall by campaign size against candidates per trace; reduction ratio; query latency | indicators only |
 | 4 Score | progressive recall against comparisons spent; calibration error | cosine threshold |
 | 5 Group/explain | extended BCubed P/R, fragmentation, time to correct membership; nodes to inspect per attack, ADP | indicator connected components; HDBSCAN |
 | 6 Attribute | top-1/top-3 on known actors; unknown-actor AUROC; precision at coverage; calibration error | ATT&CK overlap only; TF-IDF + LR |
