@@ -12,7 +12,7 @@ Status: proposal. Scope: one process on one high-end workstation, demonstrating 
 6. **Candidates come from three indexes, unioned and capped.** A DynaHash-style MinHash/Hamming-LSH over behavioural shingles, an HNSW index over trace vectors, and an exact indicator index. BlockingPy is used offline to choose and tune ANN settings. Its connected-components step is never used online.
 7. **Scoring follows Progressive Entity Matching.** Cheap weights, then BFS scheduling under a per-second budget, then a calibrated gradient-boosted pair model. The budget, not the input rate, bounds compute.
 8. **Groups overlap, and "unassigned" is a valid state.** A trace belongs to zero, one or up to three groups. Merges and splits are recorded proposals, never transitive closure. Memberships express behavioural similarity, never identity.
-9. **Attribution is a separate layer with an explicit "unknown actor" hypothesis.** An actor is declared only when calibrated evidence from at least two independent evidence classes clears a precision-tuned threshold. LLMs may draft explanations from cited evidence; they never set scores.
+9. **Attribution is a separate layer with an explicit "unknown actor" hypothesis.** An actor is declared only when calibrated evidence from at least two independent evidence classes clears a precision-tuned threshold, and only once that level's precision has been measured across several held-out actors. LLMs may draft explanations from cited evidence; they never set scores.
 10. **Lineage is tamper-evident, not tamper-proof.** A BLAKE3 hash chain covers raw segments and every derived decision. Chain heads are signed with a key held outside the process and copied to an external append-only store, so rollback is detectable.
 
 ## 2. What we take from each source
@@ -82,7 +82,7 @@ flowchart LR
 
 | Record | Fields |
 |---|---|
-| Event | ts, host, subject entity, object entity, action, attributes, template_id + typed variables, event_hash |
+| Event | ts, host, source_id, source_seq, ingest_ts, subject entity, object entity, action, attributes, template_id + typed variables, event_hash |
 | Entity | typed ID (process, file, socket/flow, user, host, domain), versioned on state change (required for DAG reconstruction) |
 | Trace | anchor, window, member event hashes, state (open/sealed), features, version |
 | Link | (trace, trace or group), calibrated probability, per-evidence-class contributions |
@@ -95,8 +95,8 @@ flowchart LR
 ### 4.1 Ingest and retain searchable evidence (LogCloud, LogCrisp)
 
 - Phase 1 inputs: DARPA CDM (via PIDSMaker converters), OpTC eCAR, Sysmon/EDR JSON, auditd, Zeek conn/dns/http/ssl, and CTA command JSON, all normalized to the Event schema.
-- Raw bytes are appended to 256 MB zstd WAL segments with a per-record BLAKE3 hash. Each segment's Merkle root is chained to the previous root.
-- An online template parser (Drain-style fixed-depth tree) runs at ingest. Its output is a template ID plus typed variables. Ingest-time template IDs are immutable and are the only IDs that features and indexes use. LogGrep-style refinement at seal time writes a separate `refined_template_id` column used only for compression and search. A refined vocabulary reaches the features only through a new model version, which re-featurizes recorded traces and is logged in the ledger.
+- Raw bytes are appended to 256 MB zstd WAL segments with a per-record BLAKE3 hash. Each WAL envelope carries `source_id`, `source_seq` and `ingest_ts`, so recovery and replay rebuild the same event order. Each segment's Merkle root is chained to the previous root.
+- An online template parser (Drain-style fixed-depth tree) runs at ingest. Its output is a template ID plus typed variables. Ingest-time template IDs are immutable and are the only IDs that features and indexes use. In live operation the shipped template set is frozen. A line that matches no template creates a new one, but existing templates are never generalized in place. Generalization happens only when a new versioned vocabulary is built offline. LogGrep-style refinement at seal time writes a separate `refined_template_id` column used only for compression and search. A refined vocabulary reaches the features only through a new model version, which re-featurizes recorded traces and is logged in the ledger.
 - Segments are sealed hourly (or at 256 MB) into Parquet with dictionary-encoded `template_id`, typed variable columns and `event_hash`. A rottnest LogCloud index is built per sealed segment. DataFusion runs aggregation queries across segments.
 - Hot state lives in RocksDB: entities, open traces, the DynaHash DB and indicator postings.
 - Baselines to beat: zstd JSON plus ripgrep for search; DuckDB over untemplated Parquet for aggregation.
@@ -111,11 +111,11 @@ Tracegram's three trace-construction strategies, mapped to our modalities:
 Relations between traces (spawned-by, same process, connected-to via host + 5-tuple + time) are kept as provenance edges for reconstruction.
 
 Features, all mergeable and updated per event:
-- **Token stream:** template IDs, SCLC-normalized commands, or (action, object class) tokens; ThreatTrace compaction applied at seal.
+- **Token stream:** template IDs, SCLC-normalized commands, or (action, object class) tokens; ThreatTrace compaction applied at seal. A template ID is the hash of the template's normalized token skeleton, not a parser counter, so the same template gets the same ID in training, live runs and replay.
 - **Shingle set:** 1–3-grams of tokens plus ATT&CK technique IDs from rules or tags, sketched with 128 MinHash functions.
-- **Pooled vector:** `[log n, mean, std, min, max]` of 64-d word2vec token vectors trained offline per modality. 257 dimensions, L2-normalized, int8-quantized for indexing. Each modality's vectors live in their own embedding space, so they are indexed and compared only within that modality (§4.3).
+- **Pooled vector:** `[log n, mean, std, min, max]` of 64-d token vectors from a subword model (fastText-style character n-grams over the template text) trained offline per modality and shipped with its parser vocabulary as one versioned artifact. Templates first seen after training still get a vector, composed from their subwords, and the share of out-of-vocabulary tokens is tracked as a drift signal. 257 dimensions, L2-normalized, int8-quantized for indexing. Each modality's vectors live in their own embedding space, so they are indexed and compared only within that modality (§4.3).
 - **Timing:** log2 inter-arrival histogram (8 bins), duration, burstiness.
-- **Indicators:** file hashes, domains, IPs, ports, JA3/JA4, user agents, named pipes, service names, as exact keys. An IDF floor drops keys present in more than 0.1% of traces.
+- **Indicators:** file hashes, domains, IPs, ports, JA3/JA4, user agents, named pipes, service names, as exact keys. Postings are always written, each capped to its most recent 10k traces. At query time, keys present in more than max(100, 0.1% of indexed traces) traces are skipped as too common. Filtering at query time means eligibility can change in either direction without a backfill, and small or cold-start corpora still use their indicators.
 - **Anomaly:** maximum and mean VELOX loss over member events.
 
 Phase 3 option: a MIL aggregator (instance MLP, time-gap encoding, gated attention pooling) trained with a supervised contrastive loss on campaign and session labels. Its attention weights become key-event evidence. It is adopted only if same-campaign recall@10 improves by at least 5 points over the pooled vector at no more than 2× the CPU cost.
@@ -136,14 +136,14 @@ Phase 3 option: a MIL aggregator (instance MLP, time-gap encoding, gated attenti
 - **Weighting:** cheap scores already computed: estimated Jaccard, cosine, indicator IDF sum, time proximity, same or adjacent host.
 - **Scheduling:** BFS. Every queued trace gets its best candidate verified before any trace gets its second. Traces are ordered by anomaly score; this ordering is our extension and is compared against plain BFS and edge-centric ordering.
 - **Matching:** a LightGBM pair model with about 25 features in six evidence classes:
-  - behaviour sequence: banded normalized edit distance and LCS over compacted tokens, computed on at most the first and last 256 tokens of each trace, plus MinHash-estimated Jaccard for the remainder
+  - behaviour sequence: banded normalized edit distance and LCS over compacted tokens, computed on at most the first and last 256 tokens of each trace; whole-trace MinHash Jaccard is a separate feature and the model is trained with both
   - technique set: IDF-weighted Jaccard
   - tooling: software and tool tokens
   - infrastructure: shared indicators
   - causality: a provenance path between the two traces within 15 minutes
   - timing
 
-  Isotonic calibration on held-out pairs. Per-prediction TreeSHAP contributions are stored as evidence.
+  Isotonic calibration on held-out pairs. The raw model margin is stored with each link, along with its per-prediction TreeSHAP contributions, labelled as explaining the raw margin. The calibrated probability is a monotone transform of that margin, used for decisions. Contributions show direction and relative weight; they do not add up to the probability.
 - **Budget:** the budget counts comparison cost, not pairs. Each pair is charged its estimated work (sequence cells plus a fixed model cost) against a per-second allowance, starting at about 20k typical pairs/s and adapted under load, and each pair also has a wall-clock cap (start at 2 ms). A pair that exceeds the cap is scored without its sequence features and flagged in its evidence.
 - **Metrics:** the paper's progressive recall curve (true links found against comparisons spent) and calibration error.
 - **Baseline:** a cosine threshold alone.
@@ -177,13 +177,13 @@ Baselines: connected components over shared indicators (the failure mode to quan
     Both read the same observations, so they are stacked into one jointly calibrated score and count as one class.
   - **Infrastructure:** network indicators such as C2 domains, IPs, certificates and JA3/JA4 fingerprints, compared with actor-linked indicators, time-decayed and given low weight.
   - **Artifacts:** file hashes, malware family verdicts and named pipes or mutexes from file evidence.
-- **Fusion:** a sum of calibrated log-likelihood ratios, one term per evidence class, scored against an explicit unknown-actor hypothesis with its own prior. Weights are fit on labelled data (CTA corpus, CARBANAKv2).
+- **Fusion:** a sum of calibrated log-likelihood ratios, one term per evidence class, scored against an explicit unknown-actor hypothesis with its own prior. Execution-content weights are fit on the CTA corpus. No public dataset found so far gives infrastructure or artifact evidence for more than one labelled actor; CARBANAKv2 covers one. Those two classes therefore start with fixed, documented priors, each capped in how far it can move the log-odds, rather than learned weights.
 - **Decision rule** (posteriors are normalized over all actors plus unknown):
   - *attributed:* posterior ≥ 0.9, at least two independent evidence classes, and the top hypothesis stays first with posterior ≥ 0.5 when any one evidence class is removed (leave-one-class-out)
   - *candidates:* top posterior ≥ 0.3
   - *unresolved:* otherwise
 
-  Thresholds are re-fit to reach ≥ 0.95 precision on time-forward held-out data, and coverage is reported alongside. Command-only traces, the CTA corpus included, supply a single evidence class, so they can reach at most *candidates*. The CTA corpus therefore evaluates ranking and calibration of the execution-content score. The *attributed* rule is evaluated on CARBANAKv2 and the composite stream, where infrastructure and artifact evidence also exist.
+  Thresholds are re-fit to reach ≥ 0.95 precision on time-forward held-out data, and coverage is reported alongside. Command-only traces, the CTA corpus included, supply a single evidence class, so they can reach at most *candidates*. The CTA corpus therefore evaluates ranking and calibration of the execution-content score. The *attributed* level is off by default. It is turned on only after its precision has been measured on time-forward held-out data covering at least three actors with multi-class evidence; until then the highest output is *candidates*. CARBANAKv2 demonstrates the *attributed* path for one actor; it does not measure its precision. Phase 0 searches for more actor-labelled multi-source telemetry, for example the OTRF Security-Datasets APT29 emulation (still to be checked).
 - Attribution is re-evaluated on every group change, and its history is kept.
 - **LLM (optional, analyst-triggered):** drafts a justification from stored evidence records. Every cited evidence ID is checked to exist. It has no effect on scores.
 
@@ -228,11 +228,17 @@ Three levels: **incident** (one attack execution), **campaign** (the same operat
 
 The composite stream uses OpTC benign days as background, with CTA beacon sessions injected as process-creation events under an implant process on chosen hosts, plus the ATLASv2 and CARBANAKv2 attacks. Timestamps and IDs are remapped. Actors held out of training are injected as "unknown". Injected activity is easier to separate than organic activity, so composite results are reported separately from single-dataset results.
 
+None of the source datasets labels a trace with more than one campaign. The composite stream therefore adds constructed overlap scenarios, for example:
+- two injected campaigns that share an implant build and C2 infrastructure;
+- one host where two campaigns' commands run in the same session.
+
+Their manifests carry several campaign labels per trace. The metrics for overlapping membership (extended BCubed on multi-label traces, the three-membership cap, seeding a second campaign from an assigned trace) are reported only on these constructed scenarios.
+
 ### 7.2 Protocol
 
 - Time-forward splits everywhere.
 - Group-aware splits: no session, beacon or incident appears in both train and test.
-- Open-set: 20% of actors held out entirely.
+- Open-set: 20% of actors are held out entirely, split into disjoint validation and test sets. Every attribution input is built per split. Held-out actors are removed from classifier training, from the ATT&CK snapshot (group node, aliases, campaigns and `uses` relations; techniques and software stay if other actors use them), from the CTI corpus and from actor-linked indicator lists. An actor counts as unknown only if no input can name it.
 - At least 5 seeds for every learned component, reporting mean, min and max.
 - Thresholds are fit on validation data, never on test data.
 - Cost is reported throughout: CPU-hours, peak RAM, and disk per day of telemetry.
@@ -304,7 +310,7 @@ Only after Phase 3, decide whether to go multi-node (sharding by host, a queue i
 
 ## 9. Risks and open questions
 
-- **Actor labels are scarce.** No public dataset joins telemetry to named actors at scale. Actor-level claims are limited to the CTA corpus (honeypots, mostly Cobalt Strike, 2020–2022) and the Carbanak emulation, so the default output is "unresolved".
+- **Actor labels are scarce.** No public dataset joins telemetry to named actors at scale. Actor-level claims are limited to the CTA corpus (honeypots, mostly Cobalt Strike, 2020–2022) and the Carbanak emulation, so the default output is "unresolved", and *attributed* stays off until it has been measured across several actors (§4.6).
 - **Shared tooling.** Cobalt Strike and living-off-the-land binaries make cross-actor similarity common. Evidence-class independence and IDF weighting are the main defences. Measure the false-link rate between actors that use the same framework.
 - **Seed instability.** ORTHRUS's ADP swung from 1.00 to below 0.1 across seeds on E3-THEIA. Use ensembles or seed averaging for production models, and report variance.
 - **Sensor dependence.** Features learned on one capture mechanism may not transfer to another (e.g. CADETS vs THEIA). Train per sensor family and test across sensors.
@@ -330,7 +336,7 @@ crates/
   snortd/     single binary: pipeline, API, verify, replay
 lab/
   convert/    DARPA CDM, OpTC, ATLASv2, CARBANAKv2, CTA → Event Parquet
-  train/      word2vec, VELOX (PIDSMaker), pair model, actor models → ONNX
+  train/      token embeddings, VELOX (PIDSMaker), pair model, actor models → ONNX
   eval/       metrics, splits, reports
   baselines/
 bench/        dataset manifests, ground truth, replay specs, results
