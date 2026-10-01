@@ -1,345 +1,464 @@
 # snort: end-to-end build plan
 
-Status: proposal. Scope: one process on one high-end workstation, demonstrating all six stages from `docs/sota/origin/md` end to end. Basis: the PDFs in `docs/sota` and the repositories in `docs/sota/repos.md`, all cloned and read for this plan. Nothing below has been run yet; every number marked "target" is to be confirmed or revised in Phase 0/1.
+Status: proposal, second version. It was rewritten after running three of the linked codebases on their own data:
+- DynaHash and PER: `docs/assessment/dynahash-per.md`
+- LogCloud: `docs/assessment/logcloud.md`
+
+The other repositories have been read but not yet run; Phase 0 runs them. Numbers marked "target" are starting points, to be replaced by measured baselines.
+
+Scope: one person, one workstation, one process, demonstrating all six stages from `docs/sota/origin/md` end to end on public data.
+
+## 0. Definition of done
+
+One command, `snort demo`, on the reference workstation and from a clean checkout:
+1. Replays DARPA E3-CADETS, then the composite stream (§7.1), at 10× real time.
+2. Produces groups of related traces with their evidence, ORTHRUS-style attack graphs, and for each group either ranked actor candidates or "unresolved".
+3. Passes `snort verify` on the decision ledger.
+4. Writes a metrics report comparing every stage with its baseline, plus the ablation table (§7.4).
+
+Everything in this plan exists to make that command produce honest numbers.
 
 ## 1. Decisions
 
-1. **One Rust binary for the live path, Python for the lab.** `snortd` runs ingestion through attribution in a single process with internal threads. `lab/` (Python) does dataset conversion, training, baselines and evaluation. Models cross the boundary as ONNX. Reason: one process needs real parallelism, bounded memory and predictable latency; the reusable storage code (rottnest/LogCloud) is Rust; the research code is batch Python that would need rewriting for streaming regardless.
-2. **Build the benchmark before the system.** No public dataset covers all six stages. The first deliverable is a replay harness with a three-level ground truth (incident ⊂ campaign ⊂ actor) assembled from DARPA TC, OpTC, ATLASv2 and CARBANAKv2 (PIDSMaker ground truth) and the Unveiling-CTAs command corpus.
-3. **Simplest working version first, every stage.** Each stage ships with a baseline number. A more complex method replaces it only if it wins on the benchmark by a stated margin. This applies the main finding of *Sometimes Simpler is Better*.
-4. **Template extraction happens once, at ingest, and serves two stages.** LogCloud-style template/variable splitting drives compression and substring search (stage 1). The same template IDs are the abstract action tokens for behavioural representation (stage 2).
-5. **Trace representations are mergeable summaries.** ThreatTrace-style pooled embedding statistics, a MinHash sketch, a technique set and a timing histogram. Open traces update in O(1) per event. A learned Tracegram-style aggregator is a Phase 3 option, not a dependency.
-6. **Candidates come from three indexes, unioned and capped.** DynaHash's MinHash/Hamming-LSH over behavioural shingles (the authors' code, with the defects found in `docs/assessment/dynahash-per.md` fixed), an HNSW index over trace vectors, and an exact indicator index. BlockingPy is used offline to choose and tune ANN settings. Its connected-components step is never used online.
-7. **Scoring follows Progressive Entity Matching, starting with sorted neighbourhood.** Trace linking is deduplication, and in PER's own results sorted neighbourhood leads for deduplication at scale while NN + BFS trails, so NN + BFS and Join are challengers. Cheap weights, then budgeted progressive scheduling, then a calibrated gradient-boosted pair model. The budget, not the input rate, bounds compute.
-8. **Groups overlap, and "unassigned" is a valid state.** A trace belongs to zero, one or up to three groups. Merges and splits are recorded proposals, never transitive closure. Memberships express behavioural similarity, never identity.
-9. **Attribution is a separate layer with an explicit "unknown actor" hypothesis.** An actor is declared only when calibrated evidence from at least two independent evidence classes clears a precision-tuned threshold, and only once that level's precision has been measured across several held-out actors. LLMs may draft explanations from cited evidence; they never set scores.
-10. **Lineage is tamper-evident, not tamper-proof.** A BLAKE3 hash chain covers raw segments and every derived decision. Chain heads are signed with a key held outside the process and copied to an external append-only store, so rollback is detectable.
+1. **Python first, in one process, with native libraries doing the heavy work.**
+   - **Process:** the live path is one Python process. It uses Arrow and Polars micro-batches, RocksDB, usearch, LightGBM, ONNX Runtime and rottnest's Rust LogCloud.
+   - **The one exception:** segment indexing runs in a helper process, because LogCrisp writes into its working directory, is not reentrant, and can crash on bad input.
+   - **Porting:** a component moves to Rust only once profiling shows it is the bottleneck. The port is validated against the Python version on the same seeds.
+   - **Why:** most of the linked code is Python or has Python bindings; the plan is sized for one person; and end-to-end evidence matters more than raw speed early on.
+2. **Run every repository before relying on it.** Running DynaHash, PER and LogCloud found five classes of problem:
+   - wrong formulas;
+   - silent record loss;
+   - missed search results;
+   - crashes;
+   - dependencies that no longer install or that change results.
 
-## 2. What we take from each source
+   Each adopted repository is therefore reproduced on its own data, pinned, given regression tests, and written up in `docs/assessment/` before its numbers are trusted. Status is in §2.
+3. **One dataset end to end before adding more.** E3-CADETS first (about 10 GB, three attacks, node-level ground truth). Then THEIA and CLEARSCOPE, then the composite stream.
+4. **Go/no-go tests before building on assumptions.** Two tests run in Phase 0:
+   - whether the trace definition keeps each attack in a few pure traces;
+   - whether behavioural similarity separates traces from the same attack from unrelated ones.
 
-Each source is marked adopt (use as-is), adapt (reimplement the method), or reject, with the reason found in the paper or code.
+   If either fails, the representation is redesigned before anything downstream is built.
+5. **Simplest working version first, at every stage.** Each stage ships with a baseline number. A more complex method replaces it only if it wins on the benchmark by a stated margin, the main lesson of *Sometimes Simpler is Better*.
+6. **Template IDs are content hashes.**
+   - **Live features:** an online Drain parser supplies the tokens.
+   - **Storage and search:** LogCrisp, via LogCloud, runs when a segment is sealed.
+   - **Why hashing:** LogCrisp retrains its templates for every batch, so its IDs are not stable. Every template is identified by a hash of its normalized text, which makes both vocabularies stable and lets them be joined.
+7. **Trace representations are mergeable summaries.** They combine ThreatTrace-style pooled embedding statistics, a MinHash sketch, a technique set and a timing histogram, so open traces update in O(1) per event.
+8. **Candidates come from three indexes, unioned and capped:**
+   - DynaHash LSH, using the authors' code with its defects fixed;
+   - one HNSW index per modality;
+   - an exact indicator index.
 
-| Source | Stage | Use | Reason (from paper and code) |
-|---|---|---|---|
-| LogCloud (PVLDB 2025) | 1 | Adopt: the `logcloud` index in `marsupialtail/rottnest` (Rust) over local Parquet segments | Working implementation of LogGrep template/variable split plus FM-index substring search. The paper measured object storage, so local NVMe figures must be measured. |
-| LogCrisp (ATC 2025) | 1 | Adapt the principle: pattern extraction at ingest, vectorized aggregation over columnar segments (DataFusion on Parquet) | No public code found. We do not claim its 3.8× ingestion figure. |
-| ThreatTrace (CAiSE 2025) | 2, 5 | Adapt: trace compaction (merge repeats and frequent pairs), action-token embeddings, pooled `[count, mean, std, min, max]` trace vector | Code is R notebooks over its FedCSIS data, batch only. Its fuzzy c-means memberships sum to 1, which forces every trace into some cluster. We replace it with possibilistic membership (§4.5). |
-| Tracegram (USENIX Sec 2026) | 2 (Phase 3) | Adapt the formulation: per-instance encoder plus time-gap-aware attention pooling, attention weights as key-event evidence | The repo uses a 24-layer linear-attention transformer over packet tokens and needs pcaps and a GPU: 29.8 ms per trace, 480 MB peak on an RTX 3080 Ti at batch 1. We use flow and event features instead of payload tokens. |
-| DynaHash (Inf. Syst. 2026) | 3 | Adopt the authors' code as the stage-3 reference after fixing its defects; port only if measured insert rate demands it, validated against the fixed Python | Ran it (`docs/assessment/dynahash-per.md`): recall 0.99 on ACM–DBLP and 0.96 on Scholar–DBLP, about 1,000 inserts/s in memory and 540/s with RocksDB. Defects: the hash-table count is wrong for any θ ≠ 0.5 (3,158 tables instead of 19 at θ = 0.7); records with the same string collapse into one; T exists only in a demo script that keeps every vector in RAM; multi-probe trees are built once and miss later inserts; the input is fixed to character 2-grams. |
-| BlockingPy (SoftwareX 2026) | 3, offline | Adopt for ANN backend selection and blocking metrics (pairs completeness, reduction ratio) on replay corpora | Each `block()` call builds a fresh index and returns connected components of the kNN graph (`blocker.py`, igraph `components`). Transitive chaining is wrong where tools are shared. |
-| Progressive Entity Matching (SIGMOD 2025) | 4 | Adopt the repo's runner and configs over pinned pyJedAI as the stage-4 benchmark harness. Use sorted neighbourhood as the primary progressive method; NN + BFS and Join are challengers. | Ran it on D2: Join reproduces exactly (AUC 0.770), sorted neighbourhood closely (0.498 vs 0.528); PESM does not (0.314 vs 0.590), most likely because pyJedAI is unpinned. The NN workflow needed about 6 s per record to embed on 4 CPU cores. In the shipped synthetic deduplication results (10K–300K), sorted neighbourhood and Sparkly lead (AUC about 0.40–0.43), NN + BFS trails (about 0.32), and Join has no result past 10K. The paper evaluates static batch ordering only, so the streaming adaptation must be measured. |
-| ORTHRUS (USENIX Sec 2025) | 5 | Adapt the reconstruction natively: 15-minute subgraph → DAG → backward/forward trace to entries and exits → criticality = mean of normalized out/in-degree and normalized anomaly → union of critical dependency graphs | The repo is batch over Postgres, run on 1 TB RAM and an 80 GB GPU. Its false positives cluster in the one-hop neighbourhood of attack nodes. |
-| Sometimes Simpler is Better / PIDSMaker (USENIX Sec 2025) | 5, evaluation | Adopt VELOX (word2vec node features, linear encoder, edge-type prediction loss) as the per-event anomaly score, trained in PIDSMaker and exported to ONNX. Adopt its evaluation rules: node-level labels, ADP, at least 5 seeds, no tuning on test data, report cost. | VELOX runs on CPU, peaks at 5.7 MB RAM, and reports about 2,400 edges/s against a 1,832 edges/s dataset peak. ORTHRUS's ADP on E3-THEIA ranged from 1.00 to below 0.1 across seeds. |
-| Unveiling Cyber Threat Actors (DTRAP 2025) | 6, ground truth | Adopt the dataset and the SCLC normalization idea. Retrain with beacon-grouped and time-forward splits and compare with TF-IDF plus logistic regression. | The shipped JSON has 137 actor keys, 94 with commands, grouped by beacon ID with timestamps and ATT&CK technique tags. The published split is random and stratified over 32-command windows (`data_prep/create_datasets.py`), so windows from one beacon land in both train and test. The reported F1 (95.11 / 93.60 / 88.95) is likely inflated. |
-| AURA (arXiv 2025) | 6 | Adapt the pattern: retrieve structured TTP, tool and infrastructure evidence, then rank actors, with deterministic scoring. LLM only for written justification. | Best result was 63.33% top-1 (GPT-4o) on 30 reports with pass@3, from report text rather than telemetry. |
-| TRACE (arXiv 2026) | 6, later | Phase 1 uses MITRE ATT&CK STIX directly as the actor graph. TRACE-style LLM extraction from reports comes later. | Entity extraction F1 is 81.24%, so extracted facts need review before they influence scores. |
-| Honeypot hierarchical clustering (DTRAP 2026) | evaluation reference | Reference only | 176 patterns in 18 clusters. The preprint link in `repos.md` returns 403. |
-| jev-ids | none | Reject for the core pipeline; can be plugged in later as an optional detector | Sends each flow to an external paid API and is benchmarked only on single NSL-KDD flows. |
+   BlockingPy is used offline only.
+9. **Scoring follows Progressive Entity Matching, starting with sorted neighbourhood.** Trace linking is deduplication. In PER's own results sorted neighbourhood leads for deduplication at scale, so NN + BFS and Join are challengers. A calibrated gradient-boosted pair model makes the final match decision, and a compute budget bounds the work.
+10. **Groups overlap, and "unassigned" is a valid state.** A trace belongs to zero to three groups. Merges and splits are recorded proposals, never transitive closure. Memberships express behavioural similarity, never identity.
+11. **Attribution is a separate layer with an explicit "unknown actor" hypothesis.**
+    - **Default output:** ranked candidates or "unresolved".
+    - **The "attributed" level stays off** until its precision is measured across at least three held-out actors with independent evidence.
+    - **Where that data comes from:** an emulation lab built in Phase 3 (§7.1), because no public dataset provides it.
+    - **LLMs:** may draft explanations from cited evidence; they never set scores.
+12. **Lineage is tamper-evident, not tamper-proof.** A BLAKE3 hash chain covers raw segments and every derived decision. Chain heads are signed with a key held outside the process; external copies of the heads, which make rollback detectable, are added once the core loop works.
+
+## 2. What we keep from each repository
+
+Status meanings:
+- **Run:** reproduced on its own data here.
+- **Read:** code inspected only.
+
+| Repository | Keep | Leave | Status | Key findings |
+|---|---|---|---|---|
+| `marsupialtail/logcloud` (C++ LogCloud, published as `rottnest==1.0.4`) | The LogCrisp template trainer and compressor source (`vendored/LogCrisp_*`); the index format as the reference design | Its search and its `tail` mode | **Run** | 192 MB indexed in 25 s, about 21× smaller. At 961 MB, 22 of 40 exact-ID lookups returned nothing and some numeric queries crashed. Queries spanning a variable boundary (IP:port, template text) return nothing. `pip install rottnest` now installs 1.5.0, which lacks this code. |
+| `marsupialtail/rottnest` (Rust LogCloud, `rottnest==1.5.0`) | The LogCloud index and search over Parquet segments we write ourselves, pinned with `getdaft==0.3.15` | — | **Run** | Same 961 MB: 40 of 40 exact lookups, about 1.3 s per query, about 4 MB/s indexing on 4 cores. Index is 229 MB on top of 105 MB Parquet (random IDs, close to the worst case). Shares the boundary-query problem; splitting the query and filtering for the full string fixed it in testing. Search breaks with current `getdaft`. |
+| `dimkar121/DynaHash` | The code: MinHash, Hamming LSH, RocksDB store, multi-probe, ranked retrieval | — | **Run** | Recall reproduces (0.99, 0.96). About 1,000 inserts/s. Five defects to fix: hash-table count wrong for θ ≠ 0.5; same-key records collapse; T exists only in a demo script and keeps all vectors in RAM; multi-probe trees are static; input fixed to character 2-grams. Its RocksDB binding is missing from `requirements.txt`. |
+| `JacobMaciejewski/PER-Design-Space-Exploration` | Runner and configs over pinned pyJedAI as the scheduling benchmark; sorted neighbourhood as the primary method | NN + BFS as the default | **Run** | Join reproduces exactly and sorted neighbourhood closely; PESM does not (unpinned pyJedAI). NN embedding took about 6 s per record on CPU. Shipped deduplication results favour sorted neighbourhood. |
+| `ncn-foreigners/BlockingPy` | Offline ANN backend comparison and blocking metrics | The live path (rebuilds the index per call; merges by connected components) | Read | To run in Phase 0 |
+| `janusza/ThreatTrace-Cyber-Attack-Detection` | Trace compaction, token embeddings, pooled `[count, mean, std, min, max]` vector; its FedCSIS data as a sanity check | Fuzzy c-means, which forces every trace into a cluster | Read | To run in Phase 0 (R notebooks) |
+| `YuchenZhang-Academic/Tracegram` | The formulation: per-instance encoder plus time-aware attention pooling, as a Phase 3 option | The 24-layer packet transformer (needs pcaps and a GPU) | Read | 29.8 ms per trace on an RTX 3080 Ti (paper) |
+| `ubc-provenance/orthrus` | The reconstruction algorithm, reimplemented on demand; per-attack ground truth via PIDSMaker | Postgres batch pipeline and the GNN | Read | Seed instability: ADP from 1.00 to below 0.1 on E3-THEIA (Bilot et al.) |
+| `ubc-provenance/PIDSMaker` | VELOX training as the per-event anomaly score; dataset converters; node-level ground truth; evaluation rules (multiple seeds, ADP) | The other detectors | Read | To run in Phase 0 on E3-CADETS |
+| `bogertaNET/Unveiling-CTAs` | The dataset: 94 actors, beacon sessions, timestamps, ATT&CK tags; the SCLC normalizer | Published scores (the split leaks) | Data inspected | Retrain on beacon-grouped and time-forward splits in Phase 0 |
+| `jev-sec/jev-ids` | Nothing | Everything (per-flow paid API, NSL-KDD only) | Read | — |
+
+Papers without separate code: AURA (adapt the retrieve-then-rank pattern with fixed scoring), TRACE (later: knowledge-graph extraction from reports), honeypot clustering (preprint link returns 403).
 
 Corrections to `docs/sota/origin/md`:
-- *Sometimes Simpler is Better* reports its simple network leading on **eight of nine** DARPA datasets (abstract and conclusion), not five of seven.
-- The LogCloud paper's artifact link (`rottnest-vldb-repro`) holds Rottnest benchmark scripts (C4, UUIDs, SIFT). The LogCloud index itself is in `marsupialtail/rottnest`, behind the `logcloud` feature.
+- *Sometimes Simpler is Better* reports its simple network leading on **eight of nine** DARPA datasets, not five of seven.
+- LogCloud's C++ implementation is `marsupialtail/logcloud`, and its Rust reimplementation is in `marsupialtail/rottnest`. `rottnest-vldb-repro` holds Rottnest's own benchmarks.
+- LogCrisp's trainer and compressor code is public, vendored inside `marsupialtail/logcloud`.
 
 ## 3. System shape
 
 ```mermaid
 flowchart LR
-  subgraph snortd["snortd (one process)"]
-    R[Readers] --> N[Normalize + hash]
+  subgraph proc["snort (one Python process)"]
+    R[Readers] --> N[Normalize + hash, Arrow micro-batches]
     N --> W[(WAL segments, hash-chained)]
-    N --> P[Template parser]
-    P --> SEG[Parquet segments + LogCloud index]
+    N --> P[Drain parser, content-hashed templates]
     P --> AN[VELOX anomaly score]
     P --> TA[Trace assembler: open / sealed]
     AN --> TA
     TA --> F[Mergeable trace features]
-    F --> IDX[Candidate indexes: LSH, HNSW, indicators]
-    IDX --> SCH[Budgeted progressive scheduler]
+    F --> IDX[Candidates: DynaHash LSH, HNSW, indicators]
+    IDX --> SCH[Budgeted sorted-neighbourhood scheduler]
     SCH --> M[Calibrated pair scorer]
-    SEG --> EV[Evidence search]
-    EV --> M
     M --> G[Overlapping groups + unassigned]
     G --> X[Explainer: provenance reconstruction]
-    G --> A[Attribution: actor hypotheses + unknown]
+    G --> A[Attribution: candidates or unresolved]
+    EV[Evidence search: split + verify, hot tail scan] --> M
     EV --> A
-    M --> L[(Decision ledger, hash-chained)]
+    M --> L[(Decision ledger)]
     G --> L
     A --> L
   end
+  W --> SEAL[Sealed Parquet segments]
+  SEAL --> IX["Indexer helper process: LogCrisp + LogCloud (rottnest 1.5.0)"]
+  IX --> EV
+  SEAL --> EV
   KB[("ATT&CK STIX + CTI corpus")] --> A
-  LAB[lab: training and evaluation, ONNX models] -.-> AN
+  LAB[lab: training and evaluation] -.-> AN
   LAB -.-> M
   LAB -.-> A
 ```
 
-**Threads.** One reader per source; a normalize/parse pool; trace assembler shards keyed by host; a feature/index worker; a scheduler/matcher pool; a single writer for group and attribution state, so group state needs no locks; a low-priority segment sealer; the API. Channels are bounded. Under overload the matching budget shrinks first.
+**Concurrency.** Readers and native-library calls (Arrow, RocksDB, usearch, LightGBM, ONNX Runtime) run on threads that release the GIL. Group and attribution state has a single writer, so it needs no locks. Channels are bounded. Under overload the matching budget shrinks first.
 
-**Ordering.** Each reader stamps a per-source sequence number before the parse pool. A per-host reorder buffer releases events to the assembler in (event time, source, sequence) order once a watermark passes (start with 5 s allowed lateness). Later arrivals are applied as versioned corrections to the affected trace, never silently reordered. This keeps shingles, inter-arrival features and process ancestry the same between live runs and replay.
+**Ordering.** Each reader stamps a per-source sequence number. A per-host reorder buffer then releases events to the assembler in (event time, source, sequence) order once a watermark passes (start with 5 s allowed lateness). Later arrivals are applied as versioned corrections to the affected trace. This keeps shingles, inter-arrival features and process ancestry identical between live runs and replay.
 
-**Loss guarantee.** No event is lost once it is appended to the WAL, because the WAL write precedes all other processing. Before that point the guarantee depends on the source. File tails and queue consumers resume from committed offsets, and agents must buffer until acknowledged, so bounded channels only add backpressure. Sources that cannot be paused (UDP syslog, NetFlow) get a dedicated receive thread with a large ring buffer. Drops are counted per source and reported, never hidden.
+**Loss guarantee.** No event is lost once it is appended to the WAL, which precedes all other processing. Before that point the guarantee depends on the source:
+- File tails and queue consumers resume from committed offsets, and agents buffer until acknowledged.
+- Sources that cannot be paused (UDP syslog, NetFlow) get a dedicated receive thread with a large ring buffer; their drops are counted and reported.
 
 **Core records.**
 
 | Record | Fields |
 |---|---|
-| Event | ts, host, source_id, source_seq, ingest_ts, subject entity, object entity, action, attributes, template_id + typed variables, event_hash |
-| Entity | typed ID (process, file, socket/flow, user, host, domain), versioned on state change (required for DAG reconstruction) |
+| Event | ts, host, source_id, source_seq, ingest_ts, subject entity, object entity, action, attributes, template_hash + typed variables, event_hash |
+| Entity | typed ID (process, file, socket/flow, user, host, domain), versioned on state change |
 | Trace | anchor, window, member event hashes, state (open/sealed), features, version |
-| Link | (trace, trace or group), calibrated probability, per-evidence-class contributions |
+| Link | (trace, trace or group), raw margin, calibrated probability, per-evidence-class contributions |
 | Group | member traces with strength and state, evidence ledger, version |
 | ActorHypothesis | group, actor or unknown, posterior, evidence classes used, decision |
-| LedgerRecord | input hashes, model and parameter hashes, output hash, previous hash |
+| LedgerRecord | input hashes, model and parameter hashes, decision context, output hash, previous hash |
 
 ## 4. Stage designs
 
 ### 4.1 Ingest and retain searchable evidence (LogCloud, LogCrisp)
 
-- Phase 1 inputs: DARPA CDM (via PIDSMaker converters), OpTC eCAR, Sysmon/EDR JSON, auditd, Zeek conn/dns/http/ssl, and CTA command JSON, all normalized to the Event schema.
-- Raw bytes are appended to 256 MB zstd WAL segments with a per-record BLAKE3 hash. Each WAL envelope carries `source_id`, `source_seq` and `ingest_ts`, so recovery and replay rebuild the same event order. Each segment's Merkle root is chained to the previous root.
-- An online template parser (Drain-style fixed-depth tree) runs at ingest. Its output is a template ID plus typed variables. Ingest-time template IDs are immutable and are the only IDs that features and indexes use. In live operation the shipped template set is frozen. A line that matches no template creates a new one, but existing templates are never generalized in place. Generalization happens only when a new versioned vocabulary is built offline. LogGrep-style refinement at seal time writes a separate `refined_template_id` column used only for compression and search. A refined vocabulary reaches the features only through a new model version, which re-featurizes recorded traces and is logged in the ledger.
-- Segments are sealed hourly (or at 256 MB) into Parquet with dictionary-encoded `template_id`, typed variable columns and `event_hash`. A rottnest LogCloud index is built per sealed segment. DataFusion runs aggregation queries across segments.
-- Hot state lives in RocksDB: entities, open traces, the DynaHash DB and indicator postings.
-- Baselines to beat: zstd JSON plus ripgrep for search; DuckDB over untemplated Parquet for aggregation.
+- **Inputs:** DARPA CDM (via PIDSMaker converters), OpTC eCAR, Sysmon/EDR JSON, auditd, Zeek, and CTA command JSON, all normalized to the Event schema in Arrow micro-batches.
+- **WAL:** raw bytes go to 256 MB zstd WAL segments with a per-record BLAKE3 hash. Each envelope carries `source_id`, `source_seq` and `ingest_ts`. Each segment's Merkle root is chained to the previous one.
+- **Live parsing:** an online Drain parser assigns templates. A template's ID is the hash of its normalized text. In live operation the shipped template set is frozen: unmatched lines create new templates, but existing ones are never generalized in place. Generalization happens only in a new, versioned vocabulary built offline.
+- **Sealing:** each hour (or 256 MB) the WAL is written to Parquet that we control. Columns: `ts`, `host`, `source_id`, `source_seq`, `event_hash`, `template_hash`, typed variables and `raw`.
+- **Indexing:** the helper process indexes the `raw` column of each sealed segment with rottnest 1.5.0 LogCloud. It works in a dedicated working directory, one segment at a time. LogCrisp's per-batch templates are hashed by their text and stored as `refined_template_hash`, for search only. A refined vocabulary reaches the features only through a new model version, which re-featurizes recorded traces and is logged in the ledger.
+- **Search wrapper**, required because of the boundary-query problem:
+  1. Split the query into variable-shaped parts.
+  2. Search the most selective part; parts that hit the dictionary are tried last.
+  3. Read only the returned row groups and keep lines containing the full query.
+  4. Scan unsealed and not-yet-indexed segments directly with Polars or DuckDB.
+- **Aggregation:** DuckDB over the Parquet segments.
+- **Hot state:** RocksDB holds entities, open traces, the DynaHash DB and indicator postings.
+- **Stage-1 bake-off (Phase 2):**
+  - **Data:** at least 100 GB of real telemetry.
+  - **Compared:** LogCloud + wrapper against zstd Parquet + DuckDB, and against ripgrep over zstd files.
+  - **Measured:** recall against grep, latency, disk and indexing CPU.
+
+  LogCloud stays only if it wins on latency at equal recall.
 
 ### 4.2 Represent each trace (ThreatTrace, Tracegram)
 
-Tracegram's three trace-construction strategies, mapped to our modalities:
-- **Host trace:** the process subtree under a session root (the first ancestor below a service boundary: sshd, winlogon, services, browser, office, script host, implant). Closed after 30 minutes idle or 24 hours; long-lived roots get rolling windows.
-- **Command trace:** one shell session or one beacon ID.
-- **Network trace:** a source host to a destination group, delimited by an idle gap, plus a 24-hour entity profile per host.
+Trace construction, using Tracegram's three strategies:
+- **Host trace:** the process subtree under a session root, meaning the first ancestor below a service boundary (sshd, winlogon, services, browser, office, script host, implant). Closed after 30 minutes idle or 24 hours; long-lived roots get rolling windows.
+- **Command trace:** one shell session or beacon ID.
+- **Network trace:** one source host to one destination group, split on idle gaps, plus a 24-hour profile per host. Phase 3.
 
-Relations between traces (spawned-by, same process, connected-to via host + 5-tuple + time) are kept as provenance edges for reconstruction.
+The Phase 0 trace-boundary test (§8) checks this definition before features are built. Relations between traces (spawned-by, same process, connected-to) are kept as provenance edges.
 
-Features, all mergeable and updated per event:
-- **Token stream:** template IDs, SCLC-normalized commands, or (action, object class) tokens; ThreatTrace compaction applied at seal. A template ID is the hash of the template's normalized token skeleton, not a parser counter, so the same template gets the same ID in training, live runs and replay.
-- **Shingle set:** 1–3-grams of tokens plus ATT&CK technique IDs from rules or tags, sketched with 128 MinHash functions.
-- **Pooled vector:** `[log n, mean, std, min, max]` of 64-d token vectors from a subword model (fastText-style character n-grams over the template text) trained offline per modality and shipped with its parser vocabulary as one versioned artifact. Templates first seen after training still get a vector, composed from their subwords, and the share of out-of-vocabulary tokens is tracked as a drift signal. 257 dimensions, L2-normalized, int8-quantized for indexing. Each modality's vectors live in their own embedding space, so they are indexed and compared only within that modality (§4.3).
+Features, all mergeable:
+- **Token stream:** template hashes, SCLC-normalized commands, or (action, object class) tokens. ThreatTrace compaction is applied at seal.
+- **Shingle set:** 1–3-grams of tokens plus ATT&CK technique IDs, sketched with 128 MinHash functions.
+- **Pooled vector:** `[log n, mean, std, min, max]` of 64-d subword token vectors (fastText-style, over template text).
+  - The vectors are trained per modality and shipped with the parser vocabulary as one versioned artifact.
+  - Unseen templates get vectors composed from their subwords, and the out-of-vocabulary rate is tracked as a drift signal.
+  - 257 dimensions, int8-quantized, compared only within a modality.
 - **Timing:** log2 inter-arrival histogram (8 bins), duration, burstiness.
-- **Indicators:** file hashes, domains, IPs, ports, JA3/JA4, user agents, named pipes, service names, as exact keys. Postings are always written, each capped to its most recent 10k traces. At query time, keys present in more than max(100, 0.1% of indexed traces) traces are skipped as too common. Filtering at query time means eligibility can change in either direction without a backfill, and small or cold-start corpora still use their indicators.
+- **Indicators:** file hashes, domains, IPs, ports, JA3/JA4, user agents, named pipes and service names, as exact keys.
+  - Postings are always written, each capped to its most recent 10k traces.
+  - At query time, keys present in more than max(100, 0.1% of indexed traces) traces are skipped as too common.
 - **Anomaly:** maximum and mean VELOX loss over member events.
 
-Phase 3 option: a MIL aggregator (instance MLP, time-gap encoding, gated attention pooling) trained with a supervised contrastive loss on campaign and session labels. Its attention weights become key-event evidence. It is adopted only if same-campaign recall@10 improves by at least 5 points over the pooled vector at no more than 2× the CPU cost.
+Phase 3 option: a MIL aggregator (instance MLP, time-gap encoding, gated attention pooling) trained with a supervised contrastive loss. It is adopted only if same-campaign recall@10 improves by at least 5 points over the pooled vector at no more than 2× the CPU cost.
 
 ### 4.3 Retrieve a small candidate set (DynaHash, BlockingPy)
 
-- **LSH:** DynaHash Hamming-LSH on the MinHash vectors, using the authors' code with these fixes: table count computed from θ, record ID separate from blocking content, token-set input instead of character 2-grams, new bucket keys inserted into the multi-probe BK-trees, and a bounded vector store. Each fix gets a regression test against the original on its bundled data. Start from the paper's settings (θ=0.5, δ=0.1, k=6 for DB, φ=4 and w=500 for T, multi-probe ω=1) and re-tune k by sampled query time, as the paper does. T answers within the latency budget; DB is consulted for high-anomaly traces and audits.
-- **ANN:** one HNSW index (usearch) per modality over pooled vectors: cosine, int8, M=32, ef_search=64, k=20, incremental inserts. Cross-modality candidates come only from modality-independent signals: provenance and causal joins, shared indicators, and technique sets. A learned cross-modal projection is a Phase 3 option under the same adoption rule as the MIL aggregator.
+- **LSH:** DynaHash, using the authors' code in `third_party/dynahash`, with the five defects fixed:
+  - table count computed from θ;
+  - record ID kept separate from blocking content;
+  - token-set input instead of character 2-grams;
+  - new bucket keys inserted into the multi-probe trees;
+  - a bounded vector store.
+
+  Each fix gets a regression test against the original on its bundled data. Start from the paper's settings (θ = 0.5, δ = 0.1, k = 6, φ = 4, w = 500, ω = 1) and re-tune k by sampled query time, as the paper does.
+- **ANN:** one usearch HNSW index per modality (cosine, int8, M = 32, ef_search = 64, k = 20). Cross-modality candidates come only from provenance joins, shared indicators and technique sets.
 - **Indicators:** capped RocksDB posting lists.
-- **Group prototypes:** a small separate HNSW per modality over group centroids, computed from that modality's members, k=10.
-- **Union:** deduplicate and cap at 50 trace candidates plus 10 groups per query.
-- **Offline:** BlockingPy runs the same corpora through faiss, hnsw, nnd and annoy to pick the backend and parameters by pairs completeness against reduction ratio.
-- **Baselines:** indicators only; brute-force cosine on a sample.
-- **Target:** neighbour recall ≥ 0.95, stratified by campaign size, at ≤ 50 candidates per trace. When a trace is queried, m same-campaign traces are already indexed. Its true neighbours are the min(50, m) of those closest in event time, and neighbour recall is the fraction of them that appear in its candidate set. Grouping needs a connected sparse set of true links, not all n(n−1)/2 pairs. A 50-candidate cap bounds full pairs completeness at 100/(n−1), so 0.95 is unreachable for campaigns of 107 or more traces even with perfect retrieval. Full pairs completeness is still reported, but only for BlockingPy comparisons.
+- **Group prototypes:** a separate HNSW per modality over group centroids, k = 10.
+- **Union:** deduplicate, then cap at 50 trace candidates plus 10 groups.
+- **Offline:** BlockingPy compares faiss, hnsw, nnd and annoy by pairs completeness against reduction ratio.
+- **Target: neighbour recall ≥ 0.95, stratified by campaign size.**
+  - **Definition:** a trace's true neighbours are the min(50, m) same-campaign traces already indexed and closest in event time. Neighbour recall is the fraction of them that appear in its candidate set.
+  - **Why not pairs completeness:** a 50-candidate cap bounds it at 100/(n−1), so it is reported only for BlockingPy comparisons.
 
 ### 4.4 Prioritize and score candidate relationships (Progressive Entity Matching)
 
-- **Weighting:** cheap scores already computed: estimated Jaccard, cosine, indicator IDF sum, time proximity, same or adjacent host.
-- **Scheduling:** incremental sorted neighbourhood. Each sealed trace inserts its r rarest shingles as sort keys into an ordered index (RocksDB, key = shingle ‖ seal sequence). Its candidates are the w nearest entries on each side of each key (start r = 8, w = 10 from PER's best D2 configuration), weighted by how many windows they share. Traces are served in anomaly order, one candidate per trace per round, so no trace starves the rest. Challengers on the same budget and benchmark: NN + BFS over the HNSW candidates (k = 5) and Join; the PER runner on pinned pyJedAI provides the batch reference numbers.
+- **Scheduling: incremental sorted neighbourhood.**
+  - Each sealed trace inserts its r rarest shingles as keys into an ordered RocksDB index (key = shingle ‖ seal sequence).
+  - Its candidates are the w nearest entries on each side of each key (start r = 8, w = 10, from PER's best D2 configuration), weighted by shared windows.
+  - Traces are served in anomaly order, one candidate per trace per round.
+  - Challengers on the same budget: NN + BFS over the HNSW candidates (k = 5), and Join.
+  - The PER runner on pinned pyJedAI provides the batch reference numbers.
 - **Matching:** a LightGBM pair model with about 25 features in six evidence classes:
-  - behaviour sequence: banded normalized edit distance and LCS over compacted tokens, computed on at most the first and last 256 tokens of each trace; whole-trace MinHash Jaccard is a separate feature and the model is trained with both
-  - technique set: IDF-weighted Jaccard
-  - tooling: software and tool tokens
-  - infrastructure: shared indicators
-  - causality: a provenance path between the two traces within 15 minutes
+  - behaviour sequence: banded normalized edit distance and LCS on at most the first and last 256 compacted tokens, plus whole-trace MinHash Jaccard
+  - technique set (IDF-weighted Jaccard)
+  - tooling
+  - infrastructure (shared indicators)
+  - causality (a provenance path within 15 minutes)
   - timing
 
-  Isotonic calibration on held-out pairs. The raw model margin is stored with each link, along with its per-prediction TreeSHAP contributions, labelled as explaining the raw margin. The calibrated probability is a monotone transform of that margin, used for decisions. Contributions show direction and relative weight; they do not add up to the probability.
-- **Budget:** the budget counts comparison cost, not pairs. Each pair is charged its estimated work (sequence cells plus a fixed model cost) against a per-second allowance, starting at about 20k typical pairs/s and adapted under load, and each pair also has a wall-clock cap (start at 2 ms). A pair that exceeds the cap is scored without its sequence features and flagged in its evidence.
-- **Metrics:** the paper's progressive recall curve (true links found against comparisons spent) and calibration error.
+  Isotonic calibration on held-out pairs. The raw margin and its TreeSHAP contributions are stored, labelled as explaining the raw margin; decisions use the calibrated probability.
+- **Budget:** counted in comparison cost, not pairs. Each pair is charged its sequence cells plus a fixed model cost, against a per-second allowance that starts at about 20k typical pairs/s and adapts under load. Each pair also has a 2 ms wall-clock cap; pairs over the cap are scored without sequence features and flagged.
+- **Metrics:** progressive recall against comparisons spent; calibration error.
 - **Baseline:** a cosine threshold alone.
 
 ### 4.5 Group and explain related activity (soft clustering, ORTHRUS)
 
 Membership:
 - s(t, g) = mean of the top-3 calibrated link probabilities between trace t and members of group g, blended with prototype similarity.
-- Keep up to three memberships with s ≥ τ_m (start at 0.5). Otherwise the trace stays unassigned; it remains indexed and can join a group later.
-- Seed a new group when a pair has p ≥ τ_seed (start at 0.8) with at least two evidence classes and the two traces share no group yet. Either trace may already belong to other groups, subject to the three-membership cap, so a trace shared by two campaigns can seed the second.
-- Membership states: proposed → supported → analyst-confirmed or analyst-rejected. Analyst membership decisions are stored as trace–group labels and used to calibrate s(t, g) and τ_m. They are never expanded into pair labels, because confirming a trace's membership in a non-transitive group does not make it a match with every member. The pair model is retrained only on pair-level labels: dataset ground truth plus explicit analyst same/different decisions on specific pairs.
-- Two groups that share strong members produce an online merge proposal. A nightly offline audit runs Leiden on the calibrated link graph and proposes splits and merges. Every change is versioned in the ledger.
+- Keep up to three memberships with s ≥ τ_m (start at 0.5). Otherwise the trace stays unassigned but remains indexed.
+- Seed a group when a pair has p ≥ τ_seed (start at 0.8) with at least two evidence classes and the two traces share no group yet. Either trace may already belong to other groups.
+- Membership states: proposed → supported → analyst-confirmed or analyst-rejected.
+  - Analyst decisions are stored as trace–group labels, which calibrate s and τ_m. They are never expanded into pair labels.
+  - The pair model trains only on pair-level labels.
+- Online merge proposals arise when two groups share strong members. A nightly Leiden audit on the calibrated link graph proposes splits and merges. Every change is versioned in the ledger.
 
 Explanation:
-- Per membership: the top evidence contributions and the shared shingles and indicators, with pointers to event hashes.
-- Per provenance member with anomalous nodes: ORTHRUS-style reconstruction (see §2), run on demand from an in-memory 48-hour temporal graph, with older edges read from RocksDB.
+- Per membership: the top evidence contributions, plus shared shingles and indicators with event-hash pointers.
+- Per provenance member with anomalous nodes, on demand from a 48-hour in-memory temporal graph (older edges from RocksDB): ORTHRUS reconstruction.
+  1. Take a 15-minute subgraph and convert it to a DAG.
+  2. Trace backward and forward to the attack's entry and exit nodes.
+  3. Score each with criticality = mean of normalized out/in-degree and normalized anomaly.
+  4. Report the union of the critical dependency graphs.
 - Per group: a timeline across all members.
 
-Metrics: extended BCubed precision and recall for overlapping clusters; fragmentation (groups per true campaign); time to correct membership; seed stability. Quality of attribution (QoA): nodes to inspect per attack, and ADP (area under the attack detection precision curve).
+Metrics: extended BCubed precision and recall; fragmentation; time to correct membership; seed stability. Quality of attribution (QoA): nodes to inspect per attack, and ADP.
 
 Baselines: connected components over shared indicators (the failure mode to quantify) and single-label HDBSCAN.
 
 ### 4.6 Attribute groups to known actors (behavioural models, AURA)
 
-- **Knowledge base:** MITRE ATT&CK Enterprise STIX 2.1 (groups, campaigns, software, techniques, `uses` relations), versioned by hash. Optionally a local CTI report corpus searched with BM25.
-- **Evidence classes** are defined by where the observation came from, not by which scorer read it:
-  - **Execution content:** commands, process trees and file operations. Two scorers read this source:
-    - IDF-weighted overlap of techniques and tools with each actor's known set;
-    - for command traces, an open-set classifier with energy or max-probability rejection (start with TF-IDF n-grams plus logistic regression; compare with the CTA hybrid model).
+- **Knowledge base:** MITRE ATT&CK Enterprise STIX 2.1, versioned by hash. Optionally a local CTI report corpus searched with BM25.
+- **Evidence classes** are defined by where the observation came from:
+  - **Execution content** (commands, process trees, file operations): IDF-weighted technique and tool overlap, plus, for command traces, an open-set classifier. Start the classifier with TF-IDF + logistic regression and compare it with the CTA hybrid model. The two scorers are stacked into one jointly calibrated score, so they count as one class.
+  - **Infrastructure** (C2 domains, IPs, certificates, JA3/JA4): time-decayed, low weight.
+  - **Artifacts** (file hashes, malware family verdicts, named pipes and mutexes).
+- **Fusion:** a sum of calibrated log-likelihood ratios, one term per class, scored against an explicit unknown-actor hypothesis with its own prior.
+  - Execution-content weights are fit on the CTA corpus.
+  - Infrastructure and artifact weights start as fixed, capped priors until the emulation lab supplies labelled data.
+- **Decision rule** (posteriors normalized over all actors plus unknown):
+  - *attributed:* posterior ≥ 0.9, at least two independent classes, and the top hypothesis stays first with posterior ≥ 0.5 when any one class is removed. Off by default until measured on at least three held-out actors with multi-class evidence.
+  - *candidates:* top posterior ≥ 0.3.
+  - *unresolved:* otherwise.
 
-    Both read the same observations, so they are stacked into one jointly calibrated score and count as one class.
-  - **Infrastructure:** network indicators such as C2 domains, IPs, certificates and JA3/JA4 fingerprints, compared with actor-linked indicators, time-decayed and given low weight.
-  - **Artifacts:** file hashes, malware family verdicts and named pipes or mutexes from file evidence.
-- **Fusion:** a sum of calibrated log-likelihood ratios, one term per evidence class, scored against an explicit unknown-actor hypothesis with its own prior. Execution-content weights are fit on the CTA corpus. No public dataset found so far gives infrastructure or artifact evidence for more than one labelled actor; CARBANAKv2 covers one. Those two classes therefore start with fixed, documented priors, each capped in how far it can move the log-odds, rather than learned weights.
-- **Decision rule** (posteriors are normalized over all actors plus unknown):
-  - *attributed:* posterior ≥ 0.9, at least two independent evidence classes, and the top hypothesis stays first with posterior ≥ 0.5 when any one evidence class is removed (leave-one-class-out)
-  - *candidates:* top posterior ≥ 0.3
-  - *unresolved:* otherwise
-
-  Thresholds are re-fit to reach ≥ 0.95 precision on time-forward held-out data, and coverage is reported alongside. Command-only traces, the CTA corpus included, supply a single evidence class, so they can reach at most *candidates*. The CTA corpus therefore evaluates ranking and calibration of the execution-content score. The *attributed* level is off by default. It is turned on only after its precision has been measured on time-forward held-out data covering at least three actors with multi-class evidence; until then the highest output is *candidates*. CARBANAKv2 demonstrates the *attributed* path for one actor; it does not measure its precision. Phase 0 searches for more actor-labelled multi-source telemetry, for example the OTRF Security-Datasets APT29 emulation (still to be checked).
-- Attribution is re-evaluated on every group change, and its history is kept.
-- **LLM (optional, analyst-triggered):** drafts a justification from stored evidence records. Every cited evidence ID is checked to exist. It has no effect on scores.
+  Thresholds are re-fit to reach ≥ 0.95 precision on time-forward held-out data, with coverage reported. Command-only traces, including all of the CTA corpus, can reach at most *candidates*.
+- **Re-evaluation:** attribution is recomputed on every group change, and its history is kept.
+- **LLM (optional, analyst-triggered):** drafts a justification from stored evidence; every cited evidence ID is checked to exist; it does not affect scores.
 
 ## 5. Tamper-evident lineage
 
-- **Raw:** per-event BLAKE3 hash, a Merkle root per segment, roots chained.
-- **Derived:** every ledger record is `hash(inputs, model hash, params hash, output, prev)`. Models, the ATT&CK bundle and configuration are content-addressed.
-- **Anchoring:** every N minutes the chain head is signed with an Ed25519 key held outside the process (TPM, HSM or a second machine). The signed head, its sequence number and the signature are also sent to an external append-only store: a second machine's write-once log, an RFC 3161 timestamp authority whose receipts are kept off the workstation, or a public transparency log. `verify` compares the local chain with the latest externally held head, which detects rollback, truncation and deleted suffixes. Without that external copy, an attacker who can rewrite local storage can roll back to an older validly signed head undetected. A workstation-only deployment therefore detects edits inside the chain, but not rollback.
-- **Decision context:** each ledger record also stores the mutable context the decision depended on: candidate-set IDs and their weights, the group-state version, the index snapshot epoch, the scheduler round and the budget in force, and the IDs of the verified pairs.
-- **Tools:** `snortd verify` recomputes the chains. `snortd replay <decision>` re-evaluates one decision from its recorded inputs and pinned model versions. Full-pipeline replay starts from a periodic state snapshot (indexes, groups, scheduler) and runs with a fixed budget instead of a load-adapted one. Both require fixed seeds, single-writer group state and the ordering rules in §3.
+- **Raw:** a BLAKE3 hash per event, a Merkle root per segment, the roots chained.
+- **Derived:** each ledger record is `hash(inputs, model hash, params hash, decision context, output, prev)`. Models, the ATT&CK bundle and configuration are content-addressed.
+- **Decision context:**
+  - candidate-set IDs and their weights;
+  - the group-state version;
+  - the index snapshot epoch;
+  - the scheduler round and the budget in force;
+  - the IDs of the verified pairs.
+- **Signing:** every N minutes the chain head is signed with an Ed25519 key held outside the process.
+- **External copies (after the core loop works):** each signed head is also sent to an external append-only store (a second machine's write-once log, an RFC 3161 timestamp authority, or a transparency log), so `verify` can detect rollback and truncation. Until then the ledger shows edits inside the chain, but not rollback.
+- **Tools:**
+  - `snort verify` recomputes the chains.
+  - `snort replay <decision>` re-evaluates one decision from its recorded inputs.
+  - Full-pipeline replay starts from a periodic state snapshot and runs with a fixed budget.
 
 ## 6. Workstation sizing and budgets
 
-Reference machine: 32 cores, 256 GB ECC RAM, two 4 TB NVMe drives (one for WAL and hot state, one for sealed segments), and an optional 24–32 GB GPU used for training only. The live path is CPU-only.
+Reference machine: 32 cores, 256 GB ECC RAM, two 4 TB NVMe drives (one for WAL and hot state, one for sealed segments), and an optional 24–32 GB GPU for training only. The live path is CPU-only.
 
-| Item | Target |
+| Item | Target or measured figure |
 |---|---|
-| Sustained ingest (normalize + hash + WAL + parse) | 100k events/s (about 55× the DARPA E5-CADETS peak of 1,832 edges/s) |
+| Sustained ingest (normalize + hash + WAL + parse), Python micro-batches | Phase 1 target 20k events/s (about 10× the DARPA E5-CADETS peak of 1,832 edges/s); 100k events/s only after profiling and porting the measured hot spots |
+| Segment indexing | Measured about 4–5 MB/s per indexing job on 4 cores. 100 GB/day of logs averages 1.2 MB/s, so one job keeps up with headroom; the unindexed tail is scanned directly. |
 | Event → trace feature update | p95 < 1 s |
 | Sealed trace → memberships | p95 < 5 s at 10× replay |
-| Pair verification budget | 20k/s |
-| HNSW memory | about 0.5 KB per trace (257 B int8 vector + level-0 links), about 50 GB per 100M traces |
-| Substring search over 30 days of segments | < 10 s |
-| Event loss under 2× overload | none after WAL append; zero for offset-resumable sources; counted and reported for sources that cannot be paused (§3) |
+| DynaHash insert | Measured about 1,000/s in memory for the original code. Enough for the E3 replay (traces, not events, are inserted); re-measured after the fixes. |
+| HNSW memory | about 0.5 KB per trace, so about 50 GB per 100M traces |
+| Event loss under 2× overload | none after WAL append; counted and reported for sources that cannot be paused |
 
 ## 7. Evaluation
 
-### 7.1 Ground truth
+### 7.1 Ground truth and datasets
 
-Three levels: **incident** (one attack execution), **campaign** (the same operator and toolset across incidents or hosts), **actor** (a named group). Each dataset supplies some of them.
+Ground truth has three levels: **incident** (one attack execution), **campaign** (the same operator and toolset across incidents or hosts) and **actor** (a named group).
 
-| Dataset | Modality | Levels | Use |
-|---|---|---|---|
-| DARPA TC E3 (CADETS, THEIA, CLEARSCOPE), E5 subsets | provenance | incident (ORTHRUS per-attack node CSVs in PIDSMaker); campaign (e.g. the Drakon implant across `Nginx_Backdoor_06/12/13` and `Firefox_Backdoor_Drakon`) | detection, reconstruction, grouping |
-| DARPA E5-TRACE (710 GB), E5-FIVEDIRECTIONS (280 GB) | provenance | incident | volume and latency |
-| OpTC h051, h201, h501 | Windows EDR | incident | enterprise background, scale |
-| ATLASv2 (10 attacks), CARBANAKv2 EDR | Windows EDR | incident; actor emulation (Carbanak) | grouping, TTP attribution |
-| Unveiling-CTAs corpus | commands | session (beacon), actor (94 with data) | behavioural attribution, open-set |
-| DAPT2020, Tracegram datasets | network | trace, attack phase | network traces (Phase 3) |
-| FedCSIS 2023 challenge (ThreatTrace data) | audit logs | trace label | representation sanity check |
-| Composite stream | Windows EDR + commands | all three | end-to-end replay |
+Datasets in the order they are used:
 
-The composite stream uses OpTC benign days as background, with CTA beacon sessions injected as process-creation events under an implant process on chosen hosts, plus the ATLASv2 and CARBANAKv2 attacks. Timestamps and IDs are remapped. Actors held out of training are injected as "unknown". Injected activity is easier to separate than organic activity, so composite results are reported separately from single-dataset results.
+| Order | Dataset | Modality | Levels | Use |
+|---|---|---|---|---|
+| 1 | DARPA E3-CADETS | provenance | incident (ORTHRUS per-attack node CSVs); campaign (Drakon implant across `Nginx_Backdoor_06/12/13`) | go/no-go tests; full pipeline first |
+| 2 | E3-THEIA, E3-CLEARSCOPE | provenance | incident; campaign (Drakon across hosts) | cross-sensor generalization, cross-host grouping |
+| 3 | Unveiling-CTAs corpus | commands | session, actor (94) | behavioural attribution ranking, open-set |
+| 4 | OpTC h051/h201/h501, ATLASv2, CARBANAKv2 | Windows EDR | incident; Carbanak emulation | composite background and attacks |
+| 5 | Composite stream | Windows EDR + commands | all three | end-to-end replay |
+| 6 | Emulation lab (built in Phase 3) | Sysmon, Zeek, file evidence | actor (4–6 emulated actors) | the only measurement of *attributed* |
+| — | E5-TRACE (710 GB), E5-FIVEDIRECTIONS (280 GB) | provenance | incident | scale and latency (Phase 3) |
+| — | DAPT2020, Tracegram datasets, FedCSIS 2023 | network, audit | trace | network traces and representation checks |
 
-None of the source datasets labels a trace with more than one campaign. The composite stream therefore adds constructed overlap scenarios, for example:
-- two injected campaigns that share an implant build and C2 infrastructure;
-- one host where two campaigns' commands run in the same session.
+**Composite stream.**
+- **Background:** OpTC benign days.
+- **Injected activity:** CTA beacon sessions as process-creation events under an implant process, plus the ATLASv2 and CARBANAKv2 attacks, with timestamps and IDs remapped. Held-out actors are injected as "unknown".
+- **Overlap scenarios:** constructed campaigns that share an implant build and C2 infrastructure, and one session carrying two campaigns, with multi-label manifests. Overlap metrics are reported only on these.
 
-Their manifests carry several campaign labels per trace. The metrics for overlapping membership (extended BCubed on multi-label traces, the three-membership cap, seeding a second campaign from an assigned trace) are reported only on these constructed scenarios.
+Injected activity is easier to separate than organic activity, so composite results are reported separately.
+
+**Emulation lab.**
+- **Setup:** a few Windows and Linux VMs with Sysmon and Zeek, running 4–6 public adversary-emulation plans (for example from the MITRE CTID Adversary Emulation Library, run with Caldera or Atomic Red Team).
+- **Runs:** several times each, with varied infrastructure and scripted benign activity alongside.
+- **What it gives:** the only practical source of several actors with execution, infrastructure and artifact evidence.
+- **Caveat:** an emulation plan reproduces an actor's documented techniques, not the actor itself. Results measure retrieval of documented behaviour and are reported that way.
 
 ### 7.2 Protocol
 
-- Time-forward splits everywhere.
-- Group-aware splits: no session, beacon or incident appears in both train and test.
-- Open-set: 20% of actors are held out entirely, split into disjoint validation and test sets. Every attribution input is built per split. Held-out actors are removed from classifier training, from the ATT&CK snapshot (group node, aliases, campaigns and `uses` relations; techniques and software stay if other actors use them), from the CTI corpus and from actor-linked indicator lists. An actor counts as unknown only if no input can name it.
-- At least 5 seeds for every learned component, reporting mean, min and max.
-- Thresholds are fit on validation data, never on test data.
-- Cost is reported throughout: CPU-hours, peak RAM, and disk per day of telemetry.
-- First internal result: CTA attribution under the random split, the beacon-grouped split and the time-forward split, to quantify the leakage.
+- **Splits:**
+  - Time-forward everywhere.
+  - Group-aware: no session, beacon or incident appears in both train and test.
+  - Open-set: 20% of actors are held out, split into disjoint validation and test sets. Every attribution input is built per split, removing held-out actors from classifier training, the ATT&CK snapshot, the CTI corpus and indicator lists.
+- **Seeds:** at least 5 for every learned component, reporting mean, min and max.
+- **Thresholds:** fit on validation data, never on test.
+- **Targets:** relative to measured baselines (for example "beat indicator-only grouping on BCubed F1 by 0.10"), set once Phase 0 baselines exist. The fixed numbers in §4 are starting points.
+- **Cost:** CPU-hours, peak RAM, and disk per day of telemetry, reported throughout.
 
 ### 7.3 Metrics by stage
 
 | Stage | Metric | Baseline |
 |---|---|---|
-| 1 Ingest | events/s, bytes per event on disk, search latency, aggregation latency | zstd + ripgrep; DuckDB |
-| 2 Represent | same-campaign recall@10 | TF-IDF n-grams |
-| 3 Retrieve | neighbour recall by campaign size against candidates per trace; reduction ratio; query latency | indicators only |
-| 4 Score | progressive recall against comparisons spent; calibration error | cosine threshold |
+| 1 Ingest | events/s, bytes per event, search recall against grep, search and aggregation latency | zstd + ripgrep; DuckDB over Parquet |
+| 2 Represent | same-campaign recall@10; separability AUC (go/no-go) | TF-IDF n-grams |
+| 3 Retrieve | neighbour recall by campaign size; reduction ratio; latency | indicators only |
+| 4 Score | progressive recall against comparisons; calibration error | cosine threshold |
 | 5 Group/explain | extended BCubed P/R, fragmentation, time to correct membership; nodes to inspect per attack, ADP | indicator connected components; HDBSCAN |
-| 6 Attribute | top-1/top-3 on known actors; unknown-actor AUROC; precision at coverage; calibration error | ATT&CK overlap only; TF-IDF + LR |
-| End to end | time from first malicious event to correct group and to attribution; analyst items per true incident per day; CPU-hours per day | — |
+| 6 Attribute | top-1/top-3; unknown-actor AUROC; precision at coverage; calibration error | ATT&CK overlap only; TF-IDF + LR |
+| End to end | time to correct group and to attribution; analyst items per true incident per day; CPU-hours per day | — |
 
 ### 7.4 Ablations
 
-Remove one stage at a time (no LSH, no ANN, no indicator index, FIFO instead of the scheduler, cosine instead of the pair model, no explanation, single-source attribution) and report the end-to-end change. This table is the evidence that each research area earns its place.
+Remove one stage at a time and report the end-to-end change:
+- no LSH;
+- no ANN;
+- no indicator index;
+- FIFO instead of the scheduler;
+- cosine instead of the pair model;
+- no explanation;
+- single-source attribution.
 
-## 8. Delivery plan
+This table is the evidence that each research area earns its place.
 
-Durations assume 2–3 engineers.
+## 8. Delivery plan (one person)
 
-**Phase 0: Benchmark (weeks 1–3)**
-- Converters from DARPA E3-CADETS/THEIA, ATLASv2, CARBANAKv2, an OpTC sample and the CTA corpus into Event Parquet.
-- Ground-truth manifests (incident, campaign, actor) and split files.
-- Replay tool with deterministic ordering and 1×–100× rate control.
-- Metric library and baselines: indicator-only grouping, TF-IDF retrieval, TF-IDF + LR attribution.
-- CTA re-evaluation under grouped and time-forward splits.
-- DynaHash and PER reproduced on their own data (done: `docs/assessment/dynahash-per.md`). Fix the DynaHash defects with regression tests, and pin pyJedAI to a version that reproduces the shipped PESM results.
+**Phase 0: Assess and test the premises (weeks 1–3)**
+- Finish the assessments, one note each in `docs/assessment/`:
+  - VELOX in PIDSMaker on E3-CADETS: reproduce ADP over 3 seeds and measure CPU inference speed;
+  - ORTHRUS ground truth loaded and checked;
+  - the ThreatTrace notebooks on their FedCSIS data;
+  - BlockingPy on a trace-shaped corpus;
+  - the CTA classifier under random, beacon-grouped and time-forward splits.
+- E3-CADETS converter to Event Parquet, plus ground-truth manifests and split files.
+- `third_party/` with pinned versions and fixes:
+  - DynaHash, with the five fixes and regression tests;
+  - PER runner + pyJedAI, pinned;
+  - rottnest 1.5.0 + `getdaft==0.3.15`.
+- **Go/no-go 1, trace boundaries:** on E3-CADETS, how many traces each attack's labelled nodes fall into, and what share of each such trace is attack activity. Pass: each attack falls mostly into 3 or fewer traces, and those traces are mostly attack activity. Exact cut-offs are fixed before looking at the results.
+- **Go/no-go 2, separability:** the distributions of MinHash Jaccard and pooled-vector cosine for same-attack trace pairs against random pairs. Pass: AUC ≥ 0.8 for at least one representation.
 
-Exit: one command produces the baseline report from the raw downloads.
+Exit: both tests decided with numbers. If a test fails, Phase 1 starts with a redesign of trace boundaries or features.
 
-**Phase 1: Walking skeleton (weeks 4–9)**
-- `snortd` with the hash-chained WAL, a Drain parser, Parquet sealing and the rottnest LogCloud index.
-- Trace assembler, mergeable features, plain MinHash LSH, HNSW and the indicator index.
-- Sorted-neighbourhood scheduler (NN + BFS as challenger) and the LightGBM pair model via ONNX Runtime.
-- Threshold memberships with the unassigned state; ATT&CK-overlap attribution with the unknown hypothesis.
-- Ledger and `verify`.
+**Phase 1: E3-CADETS end to end (weeks 4–9)**
+- Ingest → WAL → Parquet → LogCloud helper with the search wrapper → traces → features.
+- DynaHash, HNSW and the indicator index.
+- Sorted-neighbourhood scheduler; LightGBM pair model.
+- Groups, ORTHRUS reconstruction, ledger and `verify`.
+- Report with baselines and 5 seeds.
 
-Exit:
-- E3-CADETS and the composite stream replay end to end at ≥ 10× real time.
-- Every stage reports its metrics and matches or beats its baseline.
-- `verify` passes.
-- Results are stable across 5 seeds.
+Exit: `snort demo --dataset e3-cadets` produces the report; every stage beats its baseline or the report says why not.
 
-**Phase 2: Research fidelity (weeks 10–17)**
-- Full DynaHash (T and DB, multi-probe, ranked retrieval) from the fixed authors' code, measured against plain LSH. A compiled port only if the measured insert rate is the bottleneck, validated against the Python reference on the same seeds.
-- VELOX scorer trained in PIDSMaker and driving priority; ORTHRUS-style reconstruction; QoA metrics on E3.
-- Evidence search wired into matching and attribution.
-- Open-set behavioural classifier; evidence fusion with calibrated weights.
-- Offline group audit (Leiden) and merge/split proposals.
-- Analyst API and a minimal UI for groups, evidence, decisions and feedback.
+**Phase 2: Widen and attribute (weeks 10–15)**
+- THEIA and CLEARSCOPE (cross-sensor, cross-host campaign).
+- The composite stream with overlap scenarios.
+- Attribution on the CTA corpus (candidates and unresolved, open-set).
+- The stage-1 bake-off at ≥ 100 GB.
+- Profiling, with Rust ports only where measured.
 
-Exit:
-- The §4 targets are met or revised with data.
-- Reconstruction QoA is within 2× of ORTHRUS's published per-attack node counts on E3.
-- An attribution report gives precision, coverage and unknown-actor rates.
+Exit: the composite run in the report, with attribution ranking and unknown-actor metrics.
 
-**Phase 3: Learned representation, scale, ablations (weeks 18–24)**
-- MIL aggregator, subject to the §4.2 adoption rule; network traces from Zeek, evaluated on DAPT2020.
-- A 30-day-equivalent replay (E5-TRACE or OpTC volume) at the sustained target rate, plus an overload test.
-- The full ablation table and a written evaluation report.
+**Phase 3: Emulation lab, scale, ablations (weeks 16–24)**
+- Emulation lab data, used to measure *attributed* and decide whether it is turned on.
+- MIL aggregator under its adoption rule.
+- Network traces.
+- A scale replay (E5-TRACE or OpTC volume).
+- The full ablation table and a written evaluation.
 
-Exit: the end-to-end report is reproducible from a clean checkout on the reference workstation.
+Exit: §0 holds.
 
-Only after Phase 3, decide whether to go multi-node (sharding by host, a queue in front, a shared index service), guided by the measured bottleneck.
+Deferred until the core loop works: an analyst UI beyond the static report, LLM explanations, external copies of chain heads, multi-node.
 
 ## 9. Risks and open questions
 
-- **Actor labels are scarce.** No public dataset joins telemetry to named actors at scale. Actor-level claims are limited to the CTA corpus (honeypots, mostly Cobalt Strike, 2020–2022) and the Carbanak emulation, so the default output is "unresolved", and *attributed* stays off until it has been measured across several actors (§4.6).
-- **Shared tooling.** Cobalt Strike and living-off-the-land binaries make cross-actor similarity common. Evidence-class independence and IDF weighting are the main defences. Measure the false-link rate between actors that use the same framework.
-- **Seed instability.** ORTHRUS's ADP swung from 1.00 to below 0.1 across seeds on E3-THEIA. Use ensembles or seed averaging for production models, and report variance.
-- **Sensor dependence.** Features learned on one capture mechanism may not transfer to another (e.g. CADETS vs THEIA). Train per sensor family and test across sensors.
-- **Adversarial manipulation.** Mimicry, padding and timing manipulation are out of scope for Phases 1–3 and recorded as a known gap.
-- **Drift.** Retrain VELOX and the pair model on a schedule. Watch calibration on analyst-confirmed decisions.
-- **Research code reliability.** Running two of the artifacts found a formula that is wrong away from its default setting (DynaHash), silent record loss (DynaHash), an unpinned dependency that changes results (PER), and an undocumented install step (DynaHash). Every adopted artifact is first run on its own data, pinned, and regression-tested before its numbers are trusted.
+- **Actor labels are scarce.** Public data supports actor ranking only for command traces (CTA) and a single emulated actor (Carbanak). *Attributed* depends on the emulation lab, which measures documented behaviour, not real actors.
+- **Shared tooling.** Cobalt Strike and living-off-the-land binaries make cross-actor similarity common. Measure the false-link rate between actors that use the same framework.
+- **Seed instability.** Learned detectors vary widely across seeds (ORTHRUS ADP 1.00 to below 0.1). Report variance; use seed averaging.
+- **Sensor dependence.** Train per sensor family and test across sensors.
+- **Research code reliability.** Every artifact run so far had at least one defect that would have corrupted results:
+  - wrong formulas;
+  - silent record loss;
+  - missed search results;
+  - crashes;
+  - broken installs.
+
+  The remaining artifacts are assessed the same way in Phase 0.
+- **LogCloud fit.** Boundary-crossing queries need the wrapper. Templates are per-batch. The newest data must be scanned directly. On local disk, plain scans may be as fast at workstation scale: the Phase 2 bake-off decides.
+- **Python throughput.** The 100k events/s target may need Rust ports of normalization and hashing. Decide after profiling, not before.
+- **Adversarial manipulation.** Out of scope for Phases 1–3 and recorded as a known gap.
 - **Name.** Snort is an established open-source IDS (Cisco). Consider renaming before anything public.
 - **Open question:** which live telemetry the first deployment will see (Sysmon, auditd or an EDR vendor feed). This decides the parser and trace-anchor rules.
 
 ## 10. Repository layout
 
 ```
-crates/
-  core/       schema, IDs, hashing, ledger
-  ingest/     readers, normalizer, WAL, template parser
-  store/      RocksDB, Parquet segments, LogCloud (rottnest), DataFusion
-  trace/      assembler, features, MinHash, pooled vectors
-  retrieve/   DynaHash LSH, HNSW, indicator index
-  match/      scheduler, ONNX pair scorer
-  group/      memberships, proposals, audit hooks
-  explain/    temporal provenance graph, reconstruction
-  attrib/     ATT&CK knowledge base, scorers, fusion, decisions
-  snortd/     single binary: pipeline, API, verify, replay
+snort/          Python package, one process
+  ingest/       readers, normalizer, WAL, Drain parser
+  store/        Parquet segments, LogCloud helper and search wrapper, DuckDB, RocksDB
+  trace/        assembler, features, MinHash, pooled vectors
+  retrieve/     DynaHash adapter, HNSW, indicator index
+  match/        sorted-neighbourhood scheduler, pair scorer
+  group/        memberships, proposals, audit
+  explain/      temporal provenance graph, reconstruction
+  attrib/       ATT&CK knowledge base, scorers, fusion, decisions
+  ledger/       hash chain, verify, replay
+  cli.py        snort demo / verify / replay
+third_party/    pinned, patched copies: dynahash, per-runner (plus pinned pyjedai, rottnest, getdaft)
 lab/
-  convert/    DARPA CDM, OpTC, ATLASv2, CARBANAKv2, CTA → Event Parquet
-  train/      token embeddings, VELOX (PIDSMaker), pair model, actor models → ONNX
-  eval/       metrics, splits, reports
-  baselines/
-bench/        dataset manifests, ground truth, replay specs, results
+  convert/      DARPA CDM, OpTC, ATLASv2, CARBANAKv2, CTA → Event Parquet
+  train/        token embeddings, VELOX (PIDSMaker), pair model, actor models
+  eval/         metrics, splits, reports, go/no-go tests
+  emulation/    lab build scripts and run manifests (Phase 3)
+bench/          dataset manifests, ground truth, replay specs, results
 docs/
+  assessment/   one note per repository, with reproduction commands
 ```

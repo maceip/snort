@@ -79,12 +79,10 @@ This matches the paper's own conclusion: for deduplication, the sorting-based wo
 ### Verdict
 Use the runner and configs as the stage-4 benchmark harness, with pyJedAI pinned once a version that reproduces the shipped PESM numbers is found (0.3.6 does not). Start our scheduling with sorted neighbourhood, the measured winner for deduplication at scale, and treat NN + BFS as a challenger rather than the default.
 
-## Changes made to the plan
-- §2: both rows now say adopt the code, with the defects above.
-- §1 and §4.3: DynaHash code is the stage-3 reference after fixes; any port is validated against it.
-- §1 and §4.4: sorted neighbourhood is the primary progressive method; NN + BFS and Join are challengers.
-- §8 Phase 0: the reproduction runs above become the first Phase 0 items.
-- §9: licensing removed; research-code reliability (wrong formulas, unpinned dependencies, non-reproducing configs) added as a risk.
+## Effect on the plan
+- **DynaHash:** the authors' code, with the five defects fixed and regression-tested, is the LSH candidate source. It lives in `third_party/dynahash`; any compiled port is validated against it.
+- **PER:** the runner and configs over pinned pyJedAI form the scheduling benchmark. Sorted neighbourhood is the primary method; NN + BFS and Join are challengers.
+- **Licensing:** no longer a factor. Research-code reliability (wrong formulas, unpinned dependencies, non-reproducing configs) is listed as a risk instead.
 
 ## Reproduce
 
