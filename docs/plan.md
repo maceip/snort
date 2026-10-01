@@ -9,8 +9,8 @@ Status: proposal. Scope: one process on one high-end workstation, demonstrating 
 3. **Simplest working version first, every stage.** Each stage ships with a baseline number. A more complex method replaces it only if it wins on the benchmark by a stated margin. This applies the main finding of *Sometimes Simpler is Better*.
 4. **Template extraction happens once, at ingest, and serves two stages.** LogCloud-style template/variable splitting drives compression and substring search (stage 1). The same template IDs are the abstract action tokens for behavioural representation (stage 2).
 5. **Trace representations are mergeable summaries.** ThreatTrace-style pooled embedding statistics, a MinHash sketch, a technique set and a timing histogram. Open traces update in O(1) per event. A learned Tracegram-style aggregator is a Phase 3 option, not a dependency.
-6. **Candidates come from three indexes, unioned and capped.** A DynaHash-style MinHash/Hamming-LSH over behavioural shingles, an HNSW index over trace vectors, and an exact indicator index. BlockingPy is used offline to choose and tune ANN settings. Its connected-components step is never used online.
-7. **Scoring follows Progressive Entity Matching.** Cheap weights, then BFS scheduling under a per-second budget, then a calibrated gradient-boosted pair model. The budget, not the input rate, bounds compute.
+6. **Candidates come from three indexes, unioned and capped.** DynaHash's MinHash/Hamming-LSH over behavioural shingles (the authors' code, with the defects found in `docs/assessment/dynahash-per.md` fixed), an HNSW index over trace vectors, and an exact indicator index. BlockingPy is used offline to choose and tune ANN settings. Its connected-components step is never used online.
+7. **Scoring follows Progressive Entity Matching, starting with sorted neighbourhood.** Trace linking is deduplication, and in PER's own results sorted neighbourhood leads for deduplication at scale while NN + BFS trails, so NN + BFS and Join are challengers. Cheap weights, then budgeted progressive scheduling, then a calibrated gradient-boosted pair model. The budget, not the input rate, bounds compute.
 8. **Groups overlap, and "unassigned" is a valid state.** A trace belongs to zero, one or up to three groups. Merges and splits are recorded proposals, never transitive closure. Memberships express behavioural similarity, never identity.
 9. **Attribution is a separate layer with an explicit "unknown actor" hypothesis.** An actor is declared only when calibrated evidence from at least two independent evidence classes clears a precision-tuned threshold, and only once that level's precision has been measured across several held-out actors. LLMs may draft explanations from cited evidence; they never set scores.
 10. **Lineage is tamper-evident, not tamper-proof.** A BLAKE3 hash chain covers raw segments and every derived decision. Chain heads are signed with a key held outside the process and copied to an external append-only store, so rollback is detectable.
@@ -21,16 +21,16 @@ Each source is marked adopt (use as-is), adapt (reimplement the method), or reje
 
 | Source | Stage | Use | Reason (from paper and code) |
 |---|---|---|---|
-| LogCloud (PVLDB 2025) | 1 | Adopt: the `logcloud` index in `marsupialtail/rottnest` (Apache-2.0, Rust) over local Parquet segments | Working implementation of LogGrep template/variable split plus FM-index substring search. The paper measured object storage, so local NVMe figures must be measured. |
+| LogCloud (PVLDB 2025) | 1 | Adopt: the `logcloud` index in `marsupialtail/rottnest` (Rust) over local Parquet segments | Working implementation of LogGrep template/variable split plus FM-index substring search. The paper measured object storage, so local NVMe figures must be measured. |
 | LogCrisp (ATC 2025) | 1 | Adapt the principle: pattern extraction at ingest, vectorized aggregation over columnar segments (DataFusion on Parquet) | No public code found. We do not claim its 3.8× ingestion figure. |
-| ThreatTrace (CAiSE 2025) | 2, 5 | Adapt: trace compaction (merge repeats and frequent pairs), action-token embeddings, pooled `[count, mean, std, min, max]` trace vector | Code is R notebooks under GPL-2.0, batch only. Its fuzzy c-means memberships sum to 1, which forces every trace into some cluster. We replace it with possibilistic membership (§4.5). |
-| Tracegram (USENIX Sec 2026) | 2 (Phase 3) | Adapt the formulation: per-instance encoder plus time-gap-aware attention pooling, attention weights as key-event evidence | The repo (MIT) uses a 24-layer linear-attention transformer over packet tokens and needs pcaps and a GPU: 29.8 ms per trace, 480 MB peak on an RTX 3080 Ti at batch 1. We use flow and event features instead of payload tokens. |
-| DynaHash (Inf. Syst. 2026) | 3 | Adapt in Rust: bounded in-memory T (φ-prefix keys, w slots, random eviction), RocksDB DB for completeness, multi-probe, ranked retrieval | The reference code is about 350 lines of single-threaded Python with no license file, so it cannot be copied. Evaluated on bibliographic and voter strings at 0.05–0.1 s per query. Recall with T was just under 0.8 on 8M DBLP records. |
-| BlockingPy (SoftwareX 2026) | 3, offline | Adopt (MIT) for ANN backend selection and blocking metrics (pairs completeness, reduction ratio) on replay corpora | Each `block()` call builds a fresh index and returns connected components of the kNN graph (`blocker.py`, igraph `components`). Transitive chaining is wrong where tools are shared. |
-| Progressive Entity Matching (SIGMOD 2025) | 4 | Adapt: filtering → weighting → scheduling → matching, with BFS scheduling over top-k candidates (the paper's best nearest-neighbour workflow: BFS, k=5) | The paper evaluates static batch ordering and leaves matching and streaming out of scope. Budgeted streaming BFS is our adaptation and must be measured. The repo has no license and wraps pyJedAI; the scheduler is small enough to reimplement. |
-| ORTHRUS (USENIX Sec 2025) | 5 | Adapt the reconstruction natively: 15-minute subgraph → DAG → backward/forward trace to entries and exits → criticality = mean of normalized out/in-degree and normalized anomaly → union of critical dependency graphs | The repo (Apache-2.0) is batch over Postgres, run on 1 TB RAM and an 80 GB GPU. Its false positives cluster in the one-hop neighbourhood of attack nodes. |
-| Sometimes Simpler is Better / PIDSMaker (USENIX Sec 2025) | 5, evaluation | Adopt VELOX (word2vec node features, linear encoder, edge-type prediction loss) as the per-event anomaly score, trained in PIDSMaker (Apache-2.0) and exported to ONNX. Adopt its evaluation rules: node-level labels, ADP, at least 5 seeds, no tuning on test data, report cost. | VELOX runs on CPU, peaks at 5.7 MB RAM, and reports about 2,400 edges/s against a 1,832 edges/s dataset peak. ORTHRUS's ADP on E3-THEIA ranged from 1.00 to below 0.1 across seeds. |
-| Unveiling Cyber Threat Actors (DTRAP 2025) | 6, ground truth | Adopt the dataset (CC BY 4.0) and the SCLC normalization idea. Retrain with beacon-grouped and time-forward splits and compare with TF-IDF plus logistic regression. | The shipped JSON has 137 actor keys, 94 with commands, grouped by beacon ID with timestamps and ATT&CK technique tags. The published split is random and stratified over 32-command windows (`data_prep/create_datasets.py`), so windows from one beacon land in both train and test. The reported F1 (95.11 / 93.60 / 88.95) is likely inflated. |
+| ThreatTrace (CAiSE 2025) | 2, 5 | Adapt: trace compaction (merge repeats and frequent pairs), action-token embeddings, pooled `[count, mean, std, min, max]` trace vector | Code is R notebooks over its FedCSIS data, batch only. Its fuzzy c-means memberships sum to 1, which forces every trace into some cluster. We replace it with possibilistic membership (§4.5). |
+| Tracegram (USENIX Sec 2026) | 2 (Phase 3) | Adapt the formulation: per-instance encoder plus time-gap-aware attention pooling, attention weights as key-event evidence | The repo uses a 24-layer linear-attention transformer over packet tokens and needs pcaps and a GPU: 29.8 ms per trace, 480 MB peak on an RTX 3080 Ti at batch 1. We use flow and event features instead of payload tokens. |
+| DynaHash (Inf. Syst. 2026) | 3 | Adopt the authors' code as the stage-3 reference after fixing its defects; port only if measured insert rate demands it, validated against the fixed Python | Ran it (`docs/assessment/dynahash-per.md`): recall 0.99 on ACM–DBLP and 0.96 on Scholar–DBLP, about 1,000 inserts/s in memory and 540/s with RocksDB. Defects: the hash-table count is wrong for any θ ≠ 0.5 (3,158 tables instead of 19 at θ = 0.7); records with the same string collapse into one; T exists only in a demo script that keeps every vector in RAM; multi-probe trees are built once and miss later inserts; the input is fixed to character 2-grams. |
+| BlockingPy (SoftwareX 2026) | 3, offline | Adopt for ANN backend selection and blocking metrics (pairs completeness, reduction ratio) on replay corpora | Each `block()` call builds a fresh index and returns connected components of the kNN graph (`blocker.py`, igraph `components`). Transitive chaining is wrong where tools are shared. |
+| Progressive Entity Matching (SIGMOD 2025) | 4 | Adopt the repo's runner and configs over pinned pyJedAI as the stage-4 benchmark harness. Use sorted neighbourhood as the primary progressive method; NN + BFS and Join are challengers. | Ran it on D2: Join reproduces exactly (AUC 0.770), sorted neighbourhood closely (0.498 vs 0.528); PESM does not (0.314 vs 0.590), most likely because pyJedAI is unpinned. The NN workflow needed about 6 s per record to embed on 4 CPU cores. In the shipped synthetic deduplication results (10K–300K), sorted neighbourhood and Sparkly lead (AUC about 0.40–0.43), NN + BFS trails (about 0.32), and Join has no result past 10K. The paper evaluates static batch ordering only, so the streaming adaptation must be measured. |
+| ORTHRUS (USENIX Sec 2025) | 5 | Adapt the reconstruction natively: 15-minute subgraph → DAG → backward/forward trace to entries and exits → criticality = mean of normalized out/in-degree and normalized anomaly → union of critical dependency graphs | The repo is batch over Postgres, run on 1 TB RAM and an 80 GB GPU. Its false positives cluster in the one-hop neighbourhood of attack nodes. |
+| Sometimes Simpler is Better / PIDSMaker (USENIX Sec 2025) | 5, evaluation | Adopt VELOX (word2vec node features, linear encoder, edge-type prediction loss) as the per-event anomaly score, trained in PIDSMaker and exported to ONNX. Adopt its evaluation rules: node-level labels, ADP, at least 5 seeds, no tuning on test data, report cost. | VELOX runs on CPU, peaks at 5.7 MB RAM, and reports about 2,400 edges/s against a 1,832 edges/s dataset peak. ORTHRUS's ADP on E3-THEIA ranged from 1.00 to below 0.1 across seeds. |
+| Unveiling Cyber Threat Actors (DTRAP 2025) | 6, ground truth | Adopt the dataset and the SCLC normalization idea. Retrain with beacon-grouped and time-forward splits and compare with TF-IDF plus logistic regression. | The shipped JSON has 137 actor keys, 94 with commands, grouped by beacon ID with timestamps and ATT&CK technique tags. The published split is random and stratified over 32-command windows (`data_prep/create_datasets.py`), so windows from one beacon land in both train and test. The reported F1 (95.11 / 93.60 / 88.95) is likely inflated. |
 | AURA (arXiv 2025) | 6 | Adapt the pattern: retrieve structured TTP, tool and infrastructure evidence, then rank actors, with deterministic scoring. LLM only for written justification. | Best result was 63.33% top-1 (GPT-4o) on 30 reports with pass@3, from report text rather than telemetry. |
 | TRACE (arXiv 2026) | 6, later | Phase 1 uses MITRE ATT&CK STIX directly as the actor graph. TRACE-style LLM extraction from reports comes later. | Entity extraction F1 is 81.24%, so extracted facts need review before they influence scores. |
 | Honeypot hierarchical clustering (DTRAP 2026) | evaluation reference | Reference only | 176 patterns in 18 clusters. The preprint link in `repos.md` returns 403. |
@@ -54,7 +54,7 @@ flowchart LR
     AN --> TA
     TA --> F[Mergeable trace features]
     F --> IDX[Candidate indexes: LSH, HNSW, indicators]
-    IDX --> SCH[Budgeted BFS scheduler]
+    IDX --> SCH[Budgeted progressive scheduler]
     SCH --> M[Calibrated pair scorer]
     SEG --> EV[Evidence search]
     EV --> M
@@ -122,7 +122,7 @@ Phase 3 option: a MIL aggregator (instance MLP, time-gap encoding, gated attenti
 
 ### 4.3 Retrieve a small candidate set (DynaHash, BlockingPy)
 
-- **LSH:** DynaHash Hamming-LSH on the MinHash vectors. Start from the paper's settings (θ=0.5, δ=0.1, k=6 for DB, φ=4 and w=500 for T, multi-probe ω=1) and re-tune k by sampled query time, as the paper does. T answers within the latency budget; DB is consulted for high-anomaly traces and audits.
+- **LSH:** DynaHash Hamming-LSH on the MinHash vectors, using the authors' code with these fixes: table count computed from θ, record ID separate from blocking content, token-set input instead of character 2-grams, new bucket keys inserted into the multi-probe BK-trees, and a bounded vector store. Each fix gets a regression test against the original on its bundled data. Start from the paper's settings (θ=0.5, δ=0.1, k=6 for DB, φ=4 and w=500 for T, multi-probe ω=1) and re-tune k by sampled query time, as the paper does. T answers within the latency budget; DB is consulted for high-anomaly traces and audits.
 - **ANN:** one HNSW index (usearch) per modality over pooled vectors: cosine, int8, M=32, ef_search=64, k=20, incremental inserts. Cross-modality candidates come only from modality-independent signals: provenance and causal joins, shared indicators, and technique sets. A learned cross-modal projection is a Phase 3 option under the same adoption rule as the MIL aggregator.
 - **Indicators:** capped RocksDB posting lists.
 - **Group prototypes:** a small separate HNSW per modality over group centroids, computed from that modality's members, k=10.
@@ -134,7 +134,7 @@ Phase 3 option: a MIL aggregator (instance MLP, time-gap encoding, gated attenti
 ### 4.4 Prioritize and score candidate relationships (Progressive Entity Matching)
 
 - **Weighting:** cheap scores already computed: estimated Jaccard, cosine, indicator IDF sum, time proximity, same or adjacent host.
-- **Scheduling:** BFS. Every queued trace gets its best candidate verified before any trace gets its second. Traces are ordered by anomaly score; this ordering is our extension and is compared against plain BFS and edge-centric ordering.
+- **Scheduling:** incremental sorted neighbourhood. Each sealed trace inserts its r rarest shingles as sort keys into an ordered index (RocksDB, key = shingle ‖ seal sequence). Its candidates are the w nearest entries on each side of each key (start r = 8, w = 10 from PER's best D2 configuration), weighted by how many windows they share. Traces are served in anomaly order, one candidate per trace per round, so no trace starves the rest. Challengers on the same budget and benchmark: NN + BFS over the HNSW candidates (k = 5) and Join; the PER runner on pinned pyJedAI provides the batch reference numbers.
 - **Matching:** a LightGBM pair model with about 25 features in six evidence classes:
   - behaviour sequence: banded normalized edit distance and LCS over compacted tokens, computed on at most the first and last 256 tokens of each trace; whole-trace MinHash Jaccard is a separate feature and the model is trained with both
   - technique set: IDF-weighted Jaccard
@@ -270,13 +270,14 @@ Durations assume 2–3 engineers.
 - Replay tool with deterministic ordering and 1×–100× rate control.
 - Metric library and baselines: indicator-only grouping, TF-IDF retrieval, TF-IDF + LR attribution.
 - CTA re-evaluation under grouped and time-forward splits.
+- DynaHash and PER reproduced on their own data (done: `docs/assessment/dynahash-per.md`). Fix the DynaHash defects with regression tests, and pin pyJedAI to a version that reproduces the shipped PESM results.
 
 Exit: one command produces the baseline report from the raw downloads.
 
 **Phase 1: Walking skeleton (weeks 4–9)**
 - `snortd` with the hash-chained WAL, a Drain parser, Parquet sealing and the rottnest LogCloud index.
 - Trace assembler, mergeable features, plain MinHash LSH, HNSW and the indicator index.
-- BFS scheduler and the LightGBM pair model via ONNX Runtime.
+- Sorted-neighbourhood scheduler (NN + BFS as challenger) and the LightGBM pair model via ONNX Runtime.
 - Threshold memberships with the unassigned state; ATT&CK-overlap attribution with the unknown hypothesis.
 - Ledger and `verify`.
 
@@ -287,7 +288,7 @@ Exit:
 - Results are stable across 5 seeds.
 
 **Phase 2: Research fidelity (weeks 10–17)**
-- Full DynaHash (T and DB, multi-probe, ranked retrieval), measured against plain LSH.
+- Full DynaHash (T and DB, multi-probe, ranked retrieval) from the fixed authors' code, measured against plain LSH. A compiled port only if the measured insert rate is the bottleneck, validated against the Python reference on the same seeds.
 - VELOX scorer trained in PIDSMaker and driving priority; ORTHRUS-style reconstruction; QoA metrics on E3.
 - Evidence search wired into matching and attribution.
 - Open-set behavioural classifier; evidence fusion with calibrated weights.
@@ -316,7 +317,7 @@ Only after Phase 3, decide whether to go multi-node (sharding by host, a queue i
 - **Sensor dependence.** Features learned on one capture mechanism may not transfer to another (e.g. CADETS vs THEIA). Train per sensor family and test across sensors.
 - **Adversarial manipulation.** Mimicry, padding and timing manipulation are out of scope for Phases 1–3 and recorded as a known gap.
 - **Drift.** Retrain VELOX and the pair model on a schedule. Watch calibration on analyst-confirmed decisions.
-- **Licensing.** The DynaHash and PER repos have no license and ThreatTrace is GPL-2.0, so all three are reimplemented from the papers. Reusable as-is: rottnest, PIDSMaker and ORTHRUS (Apache-2.0); BlockingPy and Tracegram (MIT); the CTA data (CC BY 4.0, attribution required).
+- **Research code reliability.** Running two of the artifacts found a formula that is wrong away from its default setting (DynaHash), silent record loss (DynaHash), an unpinned dependency that changes results (PER), and an undocumented install step (DynaHash). Every adopted artifact is first run on its own data, pinned, and regression-tested before its numbers are trusted.
 - **Name.** Snort is an established open-source IDS (Cisco). Consider renaming before anything public.
 - **Open question:** which live telemetry the first deployment will see (Sysmon, auditd or an EDR vendor feed). This decides the parser and trace-anchor rules.
 
