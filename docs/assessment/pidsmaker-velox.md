@@ -27,7 +27,19 @@ Environment: 4-core cloud container, 15 GB RAM, CPU only, Python 3.10 venv (torc
 
 ## Runs
 
-In progress. Measured so far: graph construction 4 min, word2vec 20 s, feature inference 3.5 min, and training about 1.5 min per epoch on 4 CPU cores. Peak memory is about 14 GB after the patch below.
+| Run | Settings | Best ADP | Best-epoch TP / FP | Time |
+|---|---|---|---|---|
+| Published (Bilot et al., Table 4) | tuned, 5 seeds, GPU | 0.94 mean, 0.77 min | 8 / 0 (best seed) | — |
+| 1 | default `velox.yml`, seed 0 | killed out of memory at 13.6 GB when training started | — | — |
+| 2 | default `velox.yml` (embeddings 128, hidden 128), seed 0, memory patch | **0.008** | 1 / 134 | graphs 4 min, word2vec 20 s, features 3.5 min, 12 epochs about 20 min, evaluation 7 min |
+| 3 | tuned training settings (hidden 256, lr 1e-4, dropout 0.3), embeddings kept at 128 | running | — | |
+
+The tuned CADETS_E3 settings listed in `docs/docs/tuned_systems.md` also set `featurization.emb_dim=256`. That doubles the edge-feature files (6.1 GB at 128 dimensions) and the training memory, and does not fit this 15 GB, 4-core container.
+
+Run 2 detail:
+- Ground truth loads correctly: 72 of 72 attack nodes are found in 9 test windows.
+- At the best epoch, attack nodes have losses of 3.7–8. The threshold, the maximum validation loss, is 15.9.
+- Many benign nodes score higher than the attack nodes, so the ranking itself fails, not only the threshold.
 
 ## Findings
 
