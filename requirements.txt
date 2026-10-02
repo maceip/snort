@@ -5,3 +5,4 @@ scipy>=1.11
 pytest>=7
 duckdb>=0.9
 pylance
+pandas

@@ -13,6 +13,7 @@ dependencies = [
   "zstandard>=0.20",
   "blake3>=0.3",
   "pylance",
+  "pandas",
 ]
 
 [project.optional-dependencies]
