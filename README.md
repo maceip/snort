@@ -1,5 +1,4 @@
-<img width="377" height="162" alt="pork" src="https://github.com/user-attachments/assets/d3186ddf-a25b-4a87-8dbe-91c389442b1b" />
-# snort
+  <img width="151" height="200" alt="ztled" src="https://github.com/user-attachments/assets/65b8e012-8162-42ec-a5a4-965403957840" />
 
 single-process telemetry store and trace grouping engine with lance, duckdb, and blake3 tamper proofing.
 
