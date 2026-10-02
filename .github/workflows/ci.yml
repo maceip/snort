@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }} - Py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -r requirements.txt
+          pip install -e .
+
+      - name: Run Core Test Suite (Pytest)
+        run: |
+          pytest -v
+
+      - name: Run DynaHash Regression Suite
+        run: |
+          python -m unittest discover -s third_party/dynahash/tests -t third_party/dynahash
+
+      - name: Run Full Pipeline Demo & Verify Decision Ledger
+        run: |
+          python -m snort.cli demo --out bench/results/demo
+          python -m snort.cli verify-ledger bench/results/demo/ledger.jsonl
+
+      - name: Real Telemetry Blob Ingest & Search Verification (Value X)
+        run: |
+          python scripts/ci_blob_e2e.py
