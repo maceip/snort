@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from pathlib import Path
 
 import pyarrow as pa
@@ -18,6 +17,7 @@ import lance
 
 from snort.ingest.events import EVENT_COLUMNS
 from snort.ingest.wal import MANIFEST_NAME, _read_lines
+from snort.persistence import atomic_write
 
 SEALED_MANIFEST = "sealed-manifest.json"
 
@@ -49,7 +49,13 @@ def _load_manifest(sealed_dir: Path) -> list[dict]:
     return json.loads(manifest.read_text(encoding="utf-8"))["segments"]
 
 
-def seal_segments(wal_dir: str | Path, sealed_dir: str | Path, *, row_group_size: int = 100_000, **kwargs) -> list[dict]:
+def seal_segments(
+    wal_dir: str | Path,
+    sealed_dir: str | Path,
+    *,
+    row_group_size: int = 100_000,
+    **kwargs,
+) -> list[dict]:
     """Seal every unsealed WAL segment to Lance. Idempotent.
 
     Returns the manifest entries for newly sealed segments.
@@ -71,7 +77,7 @@ def seal_segments(wal_dir: str | Path, sealed_dir: str | Path, *, row_group_size
             continue
         wal_path = wal_dir / wal_entry["name"]
         if not wal_path.exists():
-            continue
+            raise FileNotFoundError(f"manifested WAL segment is missing: {wal_path}")
         events = []
         for line in _read_lines(wal_path):
             line = line.strip()
@@ -100,9 +106,9 @@ def seal_segments(wal_dir: str | Path, sealed_dir: str | Path, *, row_group_size
         new_entries.append(entry)
         prev_root = root
     if new_entries:
-        tmp = sealed_dir / (SEALED_MANIFEST + ".tmp")
-        tmp.write_text(json.dumps({"segments": sealed}, indent=2), encoding="utf-8")
-        os.replace(tmp, sealed_dir / SEALED_MANIFEST)
+        atomic_write(
+            sealed_dir / SEALED_MANIFEST, json.dumps({"segments": sealed}, indent=2)
+        )
     return new_entries
 
 
@@ -114,7 +120,9 @@ def verify_sealed_chain(wal_dir: str | Path, sealed_dir: str | Path) -> dict:
     wal_roots = {}
     wal_manifest_path = Path(wal_dir) / MANIFEST_NAME
     if wal_manifest_path.exists():
-        for entry in json.loads(wal_manifest_path.read_text(encoding="utf-8"))["segments"]:
+        for entry in json.loads(wal_manifest_path.read_text(encoding="utf-8"))[
+            "segments"
+        ]:
             wal_roots[entry["name"]] = entry["root"]
     prev_root = "GENESIS"
     events = 0
@@ -137,7 +145,14 @@ def verify_sealed_chain(wal_dir: str | Path, sealed_dir: str | Path) -> dict:
             errors.append(f"{entry['name']}: unreadable lance dataset: {exc}")
             continue
         if got != entry["count"]:
-            errors.append(f"{entry['name']}: count mismatch (manifest {entry['count']}, lance {got})")
+            errors.append(
+                f"{entry['name']}: count mismatch (manifest {entry['count']}, lance {got})"
+            )
         events += entry["count"]
         prev_root = entry["root"]
-    return {"ok": not errors, "segments_checked": len(entries), "events": events, "errors": errors}
+    return {
+        "ok": not errors,
+        "segments_checked": len(entries),
+        "events": events,
+        "errors": errors,
+    }

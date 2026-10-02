@@ -27,3 +27,6 @@ wal/
 sealed/
 index/
 data/
+snort_data/
+runtime.sqlite3*
+.writer.lock

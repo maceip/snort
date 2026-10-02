@@ -56,4 +56,37 @@ Do not silently train on synthetic demo labels or invent attribution truth.
 
 ## Completion evidence
 
-Pending implementation and verification.
+Implemented all eight acceptance rows. The plan was committed first as
+`8302fb2`; the implementation commit includes the runtime, APIs, CLI integration,
+regression tests, recovery proof, and updated user documentation.
+
+- Full repository suite: **93 passed** on 2026-10-02 (24.66 seconds).
+- Vendored DynaHash regression suite: **23 passed**.
+- Focused runtime regressions cover actual HTTP grouping/review and restart,
+  orphan/partial WAL recovery, fsync and projection failures, all membership-cap
+  entry points, consistent host/time filters, SQL joins and UTC timestamps,
+  request/event/sequence idempotency, concurrent ingest/query/seal, and correct
+  error classification. Missing manifested WAL files fail visibly; attribute
+  metadata cannot replace event identity.
+- Separate child-process HTTP proof: **passed**. Four acknowledged events,
+  three groups, analyst confirmation, supplied-label model training, source
+  checkpoint 3, and the same verified 17-record ledger survived SIGKILL and
+  restart with an unmanifested WAL tail. Two sealed hits used native Lance BM25;
+  the post-restart filtered query returned all three matching events.
+- Reproducible proof command: `.venv/bin/python scripts/verify_live_runtime.py`.
+  Report: `bench/results/live-runtime/report.json` (ignored runtime artifact).
+  SHA-256 of the exercised Python source tree:
+  `519922339adfe797c56f0e9551cb81e4e795fa3a19e5ea6e576bbe196e6a997c`.
+- Modified Python files pass Ruff's `F` checks; dashboard JavaScript passes
+  `node --check`; the patch passes `git diff --check`.
+- Existing CI blob ingest/seal/index/search and live-tail lineage proof: passed.
+  The full six-stage demo and independent CLI ledger verification also passed.
+
+Local service handoff: `http://127.0.0.1:8081`, with persistent data at
+`/Users/mac/snort/snort_data`. Port 8080 is occupied by an unrelated process.
+
+The default scorer remains explicitly `evidence-baseline`. Supervised
+logistic/isotonic training is live and persistent; meaningful real-world
+calibration requires representative user-supplied labels. Sealing/indexing is
+an explicit API/CLI action. This upgrade does not claim that the separate
+research/demo attribution and attack-reconstruction modules are live APIs.

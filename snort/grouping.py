@@ -33,6 +33,8 @@ def seed_groups(links: list[ScoredLink]) -> list[Group]:
         gb = member_of.get(link.b, set())
         if ga & gb:
             continue  # already share a group
+        if len(ga) >= MAX_MEMBERSHIPS or len(gb) >= MAX_MEMBERSHIPS:
+            continue
         gid = len(groups)
         groups.append(Group(gid=gid, members={link.a: link.proba, link.b: link.proba}))
         member_of.setdefault(link.a, set()).add(gid)
@@ -40,7 +42,9 @@ def seed_groups(links: list[ScoredLink]) -> list[Group]:
     return groups
 
 
-def membership_strength(tid: str, group: Group, link_prob: dict[tuple[str, str], float]) -> float:
+def membership_strength(
+    tid: str, group: Group, link_prob: dict[tuple[str, str], float]
+) -> float:
     probs = []
     for m, _ in group.members.items():
         if m == tid:
@@ -66,7 +70,8 @@ def assign_memberships(
             if s >= TAU_M:
                 scored.append((g.gid, s))
         scored.sort(key=lambda x: -x[1])
-        memberships[tid] = scored[:MAX_MEMBERSHIPS]
+        existing = sum(tid in group.members for group in groups)
+        memberships[tid] = scored[: max(0, MAX_MEMBERSHIPS - existing)]
         in_group = any(tid in g.members for g in groups)
         if not in_group and not memberships[tid]:
             unassigned.append(tid)

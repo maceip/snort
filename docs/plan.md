@@ -43,6 +43,12 @@ To ensure rapid delivery without regressions or rabbit holes, agents must strict
 
 ## 2. Six-Stage Architecture & Data Flow
 
+The eight live-service upgrades are implemented by the [committed delivery plan](live-implementation-plan.md); the [live API guide](live-api.md) documents their operational contracts.
+
+The six-stage diagram below is the target architecture. The current wired
+store/search path, live grouping capabilities, and recovery contracts
+are detailed in the [ingest, query, and grouping architecture](architecture.md).
+
 ```mermaid
 flowchart LR
     subgraph S1["Stage 1: Ingest & Store"]
@@ -84,7 +90,7 @@ flowchart LR
 
 | Stage | Input | Primary Implementation | Output | Fast Baseline |
 | :--- | :--- | :--- | :--- | :--- |
-| **1. Ingest & Store** | Raw JSON / CSV / CDM | [`snort.ingest.wal.WalWriter`](file:///Users/mac/snort/snort/ingest/wal.py), [`snort.store.seal`](file:///Users/mac/snort/snort/store/seal.py), [`snort.store.search`](file:///Users/mac/snort/snort/store/search.py) | Sealed Lance + BLAKE3 data hashes | Dynamic DuckDB Unified View (`UNION ALL` over Lance segments & WAL buffer) + Hybrid Lance BM25 scoring |
+| **1. Ingest & Store** | Raw JSON / CSV / CDM | [`snort.ingest.wal.WalWriter`](file:///Users/mac/snort/snort/ingest/wal.py), [`snort.store.seal`](file:///Users/mac/snort/snort/store/seal.py), [`snort.store.search`](file:///Users/mac/snort/snort/store/search.py) | Sealed Lance + content hashes; BLAKE3 WAL chain | Dynamic DuckDB Unified View (`UNION ALL` over Lance segments & WAL buffer) + Hybrid Lance BM25 scoring |
 | **2. Represent** | Normalized events | [`snort.trace.assembler`](file:///Users/mac/snort/snort/trace/assembler.py), [`snort.trace.features`](file:///Users/mac/snort/snort/trace/features.py) | Process subtrees / beacon sessions with MinHash (128) + TF-IDF | Token n-gram counts |
 | **3. Retrieve** | Trace features | [`snort.retrieve.minhash_lsh`](file:///Users/mac/snort/snort/retrieve/minhash_lsh.py), [`third_party.dynahash`](file:///Users/mac/snort/third_party/dynahash/dynahash.py) | Capped candidates ($\le 50$) | Exact indicator matches |
 | **4. Prioritize & Score** | Candidate pairs | [`snort.match.queue`](file:///Users/mac/snort/snort/match/queue.py), [`snort.match.pair_model`](file:///Users/mac/snort/snort/match/pair_model.py) | Calibrated link probabilities $P(\text{same-group})$ | Cosine threshold |
@@ -94,8 +100,8 @@ flowchart LR
 
 > [!NOTE]
 > **Storage & Search Engine Lessons from `jevalin-web`:**
-> 1. **Dynamic DuckDB Unified View:** Evidence searches query all sealed `.lance` segments and the in-memory unsealed WAL buffer in a single vectorized `UNION ALL` query, pushing down predicates and limits across both live stream and cold datasets.
-> 2. **Hybrid BM25 Scoring:** Free-text searches leverage Lance's native full-text inverted index (`raw_idx`) to compute Tantivy BM25 relevance scores (`_score`) combined with exact boolean filter expressions (`filter_expr`).
+> 1. **DuckDB Unified Query (default):** Evidence searches construct a `UNION ALL` subquery over sealed `.lance` segments and a query-local Arrow `wal_buffer` reread from unsealed WAL files. The outer query applies literal substring matching, an optional `filter_expr`, and a limit. HTTP acknowledgement now follows durable WAL and runtime commits; a query uses the same store lock.
+> 2. **Lance BM25 Search (opt-in):** `bm25=True` selects per-segment Lance native FTS with `_score`. WAL and unindexed results use substring matching and a fixed score of `0.5`; every path applies `filter_expr` with the same DuckDB semantics. Scores are sorted across segments without global normalization. The index is Lance `INVERTED`, not a separately configured Tantivy engine.
 > 3. **Guard Against Constant Numeric Columns:** Lance serialization in [`lab/convert/event_schema.py`](file:///Users/mac/snort/lab/convert/event_schema.py) guards against synthetic constant numeric columns (which trigger DuckDB Lance reader RLE page decode bugs) by casting non-schema constant numerics to strings.
 
 
@@ -128,7 +134,7 @@ sequenceDiagram
    ```bash
    .venv/bin/pytest
    ```
-   *Expected:* `64 passed` in ~9 seconds across all test files in [`tests/`](file:///Users/mac/snort/tests/).
+   *Current proof:* `93 passed` in 24.66 seconds on 2026-10-02; see the [live delivery evidence](live-implementation-plan.md).
 2. **Verify Vendored DynaHash Regression Suite:**
    ```bash
    .venv/bin/python -m unittest discover -s third_party/dynahash/tests -t third_party/dynahash

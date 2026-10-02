@@ -20,7 +20,7 @@ Implements plan section 4.5 (membership rules) and the version-1 subset
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 # Blend weight for prototype similarity in s(t, g).
 _PROTOTYPE_WEIGHT = 0.3
@@ -81,7 +81,9 @@ def membership_strength(
     mean_top3 = sum(top) / len(top)
     if prototype_similarity is None:
         return float(mean_top3)
-    return float((1.0 - _PROTOTYPE_WEIGHT) * mean_top3 + _PROTOTYPE_WEIGHT * prototype_similarity)
+    return float(
+        (1.0 - _PROTOTYPE_WEIGHT) * mean_top3 + _PROTOTYPE_WEIGHT * prototype_similarity
+    )
 
 
 def build_membership_evidence(links: Sequence[ScoredLink]) -> Dict:
@@ -132,10 +134,16 @@ class GroupManager:
 
     # -- queries ---------------------------------------------------------
     def groups_of(self, trace_id: str) -> List[str]:
-        return [gid for gid, g in self.groups.items() if trace_id in g.members]
+        return [
+            gid
+            for gid, g in self.groups.items()
+            if trace_id in g.members and g.members[trace_id].state != "analyst-rejected"
+        ]
 
     def shared_groups(self, trace_a: str, trace_b: str) -> List[str]:
-        return [gid for gid in self.groups_of(trace_a) if gid in self.groups_of(trace_b)]
+        return [
+            gid for gid in self.groups_of(trace_a) if gid in self.groups_of(trace_b)
+        ]
 
     # -- scoring ---------------------------------------------------------
     def score_trace(
@@ -155,11 +163,16 @@ class GroupManager:
         for group_id, links in links_by_group.items():
             if group_id not in self.groups:
                 continue
+            member = self.groups[group_id].members.get(trace_id)
+            if member is not None and member.state == "analyst-rejected":
+                continue
             probs = [link.probability for link in links]
             proto = prototype_by_group.get(group_id)
             strength = membership_strength(probs, proto)
             if strength >= self.tau_m and probs:
-                scored.append((group_id, strength, build_membership_evidence(list(links))))
+                scored.append(
+                    (group_id, strength, build_membership_evidence(list(links)))
+                )
         scored.sort(key=lambda item: item[1], reverse=True)
         return scored[: self.max_memberships]
 
@@ -184,6 +197,8 @@ class GroupManager:
                 group.version += 1
                 out.append(existing)
             else:
+                if len(self.groups_of(trace_id)) >= self.max_memberships:
+                    continue
                 membership = Membership(
                     trace_id=trace_id,
                     group_id=group_id,
@@ -217,6 +232,11 @@ class GroupManager:
             return None
         if self.shared_groups(trace_a, trace_b):
             return None
+        if any(
+            len(self.groups_of(tid)) >= self.max_memberships
+            for tid in (trace_a, trace_b)
+        ):
+            return None
         group_id = f"g{self._next_group}"
         self._next_group += 1
         group = Group(group_id=group_id)
@@ -241,6 +261,12 @@ class GroupManager:
             raise ValueError(f"unknown analyst decision: {decision!r}")
         group = self.groups[group_id]
         membership = group.members[trace_id]
+        if (
+            decision == "analyst-confirmed"
+            and membership.state == "analyst-rejected"
+            and len(self.groups_of(trace_id)) >= self.max_memberships
+        ):
+            raise ValueError("trace already has the maximum active memberships")
         membership.state = decision
         membership.version += 1
         group.version += 1
@@ -271,9 +297,13 @@ class GroupManager:
                     proposals.append((gid_a, gid_b, sorted(shared)))
         return proposals
 
-    def group_timeline(self, group_id: str, trace_spans: Mapping[str, Tuple[float, float]]) -> List[Tuple[str, float, float]]:
+    def group_timeline(
+        self, group_id: str, trace_spans: Mapping[str, Tuple[float, float]]
+    ) -> List[Tuple[str, float, float]]:
         """Timeline across all members: ``[(trace_id, start, end)]`` sorted by start."""
         group = self.groups[group_id]
-        spans = [(tid, *trace_spans[tid]) for tid in group.members if tid in trace_spans]
+        spans = [
+            (tid, *trace_spans[tid]) for tid in group.members if tid in trace_spans
+        ]
         spans.sort(key=lambda item: (item[1], item[0]))
         return spans

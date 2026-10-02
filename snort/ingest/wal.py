@@ -1,7 +1,7 @@
 """Hash-chained append-only WAL segments (plan sections 3 and 4.1).
 
-Layout: ``<wal_dir>/wal-<seq:06d>.jsonl.zst`` (``.jsonl`` when zstandard
-is unavailable), one JSON envelope per line:
+Layout: ``<wal_dir>/wal-<seq:06d>.jsonl``, one JSON envelope per line.
+Legacy compressed ``.jsonl.zst`` segments remain readable:
 
     {"source_id", "source_seq", "ingest_ts", "event": {...},
      "prev": <prev record hash or segment's prev root>,
@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 
 from snort.ingest.events import canonical_bytes, hash_bytes
+from snort.persistence import atomic_write, sync_directory
 
 MANIFEST_NAME = "wal-manifest.json"
 DEFAULT_MAX_BYTES = 256 * 1024 * 1024
@@ -60,8 +61,9 @@ def _read_lines(path: Path):
 
 
 def _segment_name(seq: int) -> str:
-    ext = ".jsonl.zst" if _ZSTD else ".jsonl"
-    return f"wal-{seq:06d}{ext}"
+    # Incremental JSONL makes each fsynced record independently recoverable.
+    # Legacy compressed segments remain readable through _read_lines.
+    return f"wal-{seq:06d}.jsonl"
 
 
 def record_hash(prev: str, event: dict) -> str:
@@ -71,21 +73,28 @@ def record_hash(prev: str, event: dict) -> str:
 class WalWriter:
     """Append normalized events to hash-chained WAL segments."""
 
-    def __init__(self, wal_dir: str | Path, *, max_bytes: int = DEFAULT_MAX_BYTES,
-                 max_age_s: float = DEFAULT_MAX_AGE_S) -> None:
+    def __init__(
+        self,
+        wal_dir: str | Path,
+        *,
+        max_bytes: int = DEFAULT_MAX_BYTES,
+        max_age_s: float = DEFAULT_MAX_AGE_S,
+    ) -> None:
         self.dir = Path(wal_dir)
         self.dir.mkdir(parents=True, exist_ok=True)
         self.max_bytes = max_bytes
         self.max_age_s = max_age_s
         self.manifest_path = self.dir / MANIFEST_NAME
         self.segments: list[dict] = self._load_manifest()
+        self._recover_orphans()
         self._fh = None
         self._path: Path | None = None
-        self._seq = (max((s["seq"] for s in self.segments), default=0))
+        self._seq = max((s["seq"] for s in self.segments), default=0)
         self._count = 0
         self._bytes = 0
         self._prev = self.segments[-1]["root"] if self.segments else "GENESIS"
         self._opened_at = 0.0
+        self._failed = False
 
     def _load_manifest(self) -> list[dict]:
         if not self.manifest_path.exists():
@@ -93,14 +102,57 @@ class WalWriter:
         return json.loads(self.manifest_path.read_text(encoding="utf-8"))["segments"]
 
     def _save_manifest(self) -> None:
-        tmp = self.manifest_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"segments": self.segments}, indent=2), encoding="utf-8")
-        os.replace(tmp, self.manifest_path)
+        atomic_write(
+            self.manifest_path, json.dumps({"segments": self.segments}, indent=2)
+        )
+
+    def _recover_orphans(self) -> None:
+        known = {entry["name"] for entry in self.segments}
+        prev = self.segments[-1]["root"] if self.segments else "GENESIS"
+        for path in sorted(self.dir.glob("wal-*.jsonl*")):
+            if path.name in known:
+                continue
+            if path.suffix == ".jsonl":
+                data = path.read_bytes()
+                committed = data.rfind(b"\n") + 1
+                if committed != len(data):
+                    with path.open("r+b") as handle:
+                        handle.truncate(committed)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+            count, start = 0, prev
+            for line in _read_lines(path):
+                if not line.strip():
+                    continue
+                envelope = json.loads(line)
+                expected = record_hash(prev, envelope["event"])
+                if envelope["prev"] != prev or envelope["record_hash"] != expected:
+                    raise ValueError(f"corrupt orphan WAL segment: {path.name}")
+                prev = expected
+                count += 1
+            if not count:
+                path.unlink()
+                sync_directory(self.dir)
+                continue
+            with path.open("rb") as handle:
+                os.fsync(handle.fileno())
+            self.segments.append(
+                {
+                    "seq": int(path.name.split("-")[1].split(".")[0]),
+                    "name": path.name,
+                    "count": count,
+                    "bytes": path.stat().st_size,
+                    "prev_root": start,
+                    "root": prev,
+                }
+            )
+            self._save_manifest()
 
     def _open_segment(self) -> None:
         self._seq += 1
         self._path = self.dir / _segment_name(self._seq)
-        self._fh = _open_compressed(self._path, "wb")
+        self._fh = open(self._path, "xb")
+        sync_directory(self.dir)
         self._count = 0
         self._bytes = 0
         self._opened_at = time.time()
@@ -109,11 +161,17 @@ class WalWriter:
     def _roll_if_needed(self) -> None:
         if self._fh is None:
             self._open_segment()
-        elif self._bytes >= self.max_bytes or (time.time() - self._opened_at) >= self.max_age_s:
+        elif (
+            self._bytes >= self.max_bytes
+            or (time.time() - self._opened_at) >= self.max_age_s
+        ):
             self.roll()
+            self._open_segment()
 
     def append(self, event: dict) -> dict:
         """Append one normalized event; returns its envelope."""
+        if self._failed:
+            raise RuntimeError("WAL writer requires recovery after a failed write")
         self._roll_if_needed()
         envelope = {
             "source_id": event["source_id"],
@@ -123,10 +181,21 @@ class WalWriter:
             "prev": self._prev,
             "record_hash": record_hash(self._prev, event),
         }
-        line = json.dumps(envelope, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"
+        line = (
+            json.dumps(
+                envelope, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            )
+            + "\n"
+        )
         data = line.encode("utf-8")
         assert self._fh is not None
-        self._fh.write(data)
+        try:
+            self._fh.write(data)
+            self._fh.flush()
+            os.fsync(self._fh.fileno())
+        except BaseException:
+            self._failed = True
+            raise
         self._prev = envelope["record_hash"]
         self._count += 1
         self._bytes += len(data)
@@ -137,13 +206,14 @@ class WalWriter:
         if self._fh is None:
             return None
         fh, self._fh = self._fh, None
-        fh.flush()
-        if hasattr(fh, "fileno"):
-            try:
-                os.fsync(fh.fileno())
-            except (OSError, io.UnsupportedOperation):
-                pass
-        fh.close()
+        try:
+            fh.flush()
+            os.fsync(fh.fileno())
+        except BaseException:
+            self._failed = True
+            raise
+        finally:
+            fh.close()
         assert self._path is not None
         entry = {
             "seq": self._seq,
@@ -155,10 +225,12 @@ class WalWriter:
         }
         self.segments.append(entry)
         self._save_manifest()
-        self._open_segment()
         return entry
 
     def close(self) -> None:
+        if self._failed:
+            self.abort()
+            return
         if self._fh is not None:
             if self._count:
                 self.roll()
@@ -168,13 +240,20 @@ class WalWriter:
                 assert self._path is not None
                 if self._path.exists():
                     self._path.unlink()
+                    sync_directory(self.dir)
                 self._seq -= 1
+
+    def abort(self) -> None:
+        """Leave an unmanifested tail for verified startup recovery."""
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
 
     def __enter__(self) -> "WalWriter":
         return self
 
     def __exit__(self, *exc) -> None:
-        self.close()
+        self.abort() if exc and exc[0] else self.close()
 
 
 class WalReader:
@@ -191,7 +270,10 @@ class WalReader:
 
     def segment_paths(self) -> list[Path]:
         known = {s["name"] for s in self.segments}
-        paths = [self.dir / s["name"] for s in self.segments if (self.dir / s["name"]).exists()]
+        paths = [self.dir / s["name"] for s in self.segments]
+        for path in paths:
+            if not path.exists():
+                raise FileNotFoundError(f"manifested WAL segment is missing: {path}")
         for path in self._tail:
             if path.name not in known:
                 paths.append(path)
@@ -206,7 +288,9 @@ class WalReader:
                 try:
                     yield json.loads(line)
                 except json.JSONDecodeError as exc:
-                    raise ValueError(f"{path}:{lineno}: invalid envelope: {exc}") from exc
+                    raise ValueError(
+                        f"{path}:{lineno}: invalid envelope: {exc}"
+                    ) from exc
 
     def iter_events(self):
         for envelope in self.iter_envelopes():
@@ -227,7 +311,11 @@ def verify_wal_chain(wal_dir: str | Path) -> dict:
     prev_root = "GENESIS"
     for path in reader.segment_paths():
         segments_checked += 1
-        prev = declared.get(path.name, {}).get("prev_root", prev_root) if path.name in declared else prev_root
+        prev = (
+            declared.get(path.name, {}).get("prev_root", prev_root)
+            if path.name in declared
+            else prev_root
+        )
         if path.name in declared and declared[path.name]["prev_root"] != prev_root:
             errors.append(f"{path.name}: prev_root link broken")
         count = 0
@@ -258,6 +346,13 @@ def verify_wal_chain(wal_dir: str | Path) -> dict:
             if entry["root"] != prev:
                 errors.append(f"{path.name}: segment root mismatch")
             if entry["count"] != count:
-                errors.append(f"{path.name}: count mismatch (manifest {entry['count']}, found {count})")
+                errors.append(
+                    f"{path.name}: count mismatch (manifest {entry['count']}, found {count})"
+                )
         prev_root = prev
-    return {"ok": not errors, "segments_checked": segments_checked, "events": events, "errors": errors}
+    return {
+        "ok": not errors,
+        "segments_checked": segments_checked,
+        "events": events,
+        "errors": errors,
+    }

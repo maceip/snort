@@ -61,7 +61,7 @@ class CandidateRetriever:
             denom = max(len(trace.entities), 1)
             note(tid, "provenance", min(1.0, 0.5 + 0.5 * count / denom))
 
-        ranked = sorted(estimates, key=lambda t: estimates[t], reverse=True)
+        ranked = sorted(estimates, key=lambda t: (-estimates[t], t))
         return [
             Candidate(
                 trace_id=tid,

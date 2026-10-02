@@ -107,5 +107,5 @@ class MinHashLSHIndex:
         scored = [
             (tid, minhash_jaccard(signature, self._signatures[tid])) for tid in hits
         ]
-        scored.sort(key=lambda kv: kv[1], reverse=True)
+        scored.sort(key=lambda kv: (-kv[1], kv[0]))
         return scored

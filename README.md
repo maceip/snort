@@ -1,71 +1,25 @@
-  <img width="151" height="200" alt="ztled" src="https://github.com/user-attachments/assets/65b8e012-8162-42ec-a5a4-965403957840" />
+# snort
 
-single-process telemetry store and trace grouping engine with lance, duckdb, and blake3 tamper proofing.
+single-process telemetry store and live trace grouping engine with lance, duckdb, and blake3 tamper-evident lineage.
 
 ## capabilities
 
-- live ingestion: append incoming json or cta events directly to an append-only wal.
-- columnar storage: seal wal segments into immutable lance datasets with blake3 hash tracking.
+- live ingestion: validate, deduplicate, and durably commit events to an append-only wal and live grouping pipeline.
+- columnar storage: seal wal segments into immutable lance datasets with content hash tracking.
 - fast search: query sealed lance files and the unsealed wal tail in a single pass using duckdb.
-- hybrid text retrieval: rank hits with lance bm25 full-text indexing and boolean sql filters.
-- trace grouping: group related events and score pairs without multi-process overhead.
+- hybrid text retrieval: native lance bm25 plus consistent sql filters across sealed and live events.
+- trace grouping: persist overlapping groups, evidence, analyst decisions, and trained pair models; enforce three active memberships per trace.
+- sql analytics: read-only aggregation and joins over events, traces, groups, memberships, and decision records.
 - tamper verification: verify that stored files and decision ledgers have not been altered.
 - cross-platform: prebuilt binaries for linux, macos, windows, and android.
 
-## Query Architecture
+## architecture
 
-```mermaid
----
-config:
-  theme: base
-  flowchart:
-    curve: basis
-    nodeSpacing: 30
-    rankSpacing: 38
-  themeVariables:
-    primaryColor: "#161B22"
-    primaryTextColor: "#E6EDF3"
-    primaryBorderColor: "#6E7681"
-    lineColor: "#8B949E"
-    secondaryColor: "#21262D"
-    tertiaryColor: "#0D1117"
----
-flowchart TB
+See the [ingest, query, and grouping diagrams](docs/architecture.md) for the
+current data flow and recovery boundaries. The [live api guide](docs/live-api.md)
+documents retry identities, group review, model training, and sql analytics.
 
-    SRC["Telemetry / Dataset Sources"]
-    Q["Incoming Queries"]
-
-    SRC --> READ["Readers"]
-    READ --> WAL["BLAKE3 WAL"]
-    WAL --> BUF["In-Memory Buffer"]
-
-    Q --> TEXT["Free-text / Keywords"]
-    Q --> SQL["Structured / Analytics"]
-
-    TEXT --> SDK["Lance Native SDK"]
-    SQL --> DUCK["DuckDB"]
-
-    BUF -->|"seal / append"| LANCE["Lance Dataset"]
-
-    SDK --> LANCE
-    DUCK --> BUF
-    DUCK --> LANCE
-
-    LANCE --> INDEX["Native Indexes
-    BTREE · Full-Text · Vector"]
-
-    classDef source fill:#21262D,stroke:#6E7681,color:#E6EDF3,stroke-width:1px
-    classDef engine fill:#161B22,stroke:#8B949E,color:#E6EDF3,stroke-width:1.5px
-    classDef storage fill:#0D1117,stroke:#C9D1D9,color:#FFFFFF,stroke-width:2px
-    classDef index fill:#161B22,stroke:#6E7681,color:#C9D1D9,stroke-width:1px
-
-    class SRC,Q source
-    class SDK,DUCK engine
-    class LANCE storage
-    class INDEX index
-```
 ## install
-
 
 download prebuilt binaries from github releases or install locally:
 
@@ -77,6 +31,18 @@ source .venv/bin/activate
 pip install -r requirements.txt -e .
 ```
 
+## live service
+
+```bash
+snort serve --data-dir ./snort_data --port 8080
+snort ingest events.jsonl --server http://127.0.0.1:8080 --source-id sensor-1
+snort query 'SELECT host, count(*) AS n FROM events GROUP BY host' --data-dir ./snort_data
+```
+
+The dashboard at `http://127.0.0.1:8080` exposes search, groups, sql, and api errors.
+The default pair scorer is an identified evidence baseline; supplied pair labels
+can train and persist the logistic/isotonic model through `/api/model/train`.
+
 ## usage
 
 ### 1. run the end-to-end demo
@@ -87,20 +53,24 @@ snort demo --out bench/results/demo
 
 ### 2. ingest raw events
 
+Use this standalone command with the server stopped; use `--server` for a running service.
+
 ```bash
-snort ingest --format jsonl --wal-dir wal events.jsonl
+snort ingest --format jsonl --data-dir ./snort_data events.jsonl
 ```
 
 ### 3. seal to lance
 
+Use the dashboard or `POST /api/seal` while the server is running.
+
 ```bash
-snort seal --wal-dir wal --sealed-dir sealed
+snort seal --wal-dir ./snort_data/wal --sealed-dir ./snort_data/sealed
 ```
 
 ### 4. build indexes
 
 ```bash
-snort index --sealed-dir sealed --index-dir index
+snort index --sealed-dir ./snort_data/sealed --index-dir ./snort_data/index
 ```
 
 ### 5. search evidence
@@ -108,19 +78,19 @@ snort index --sealed-dir sealed --index-dir index
 fast scan over sealed segments and wal tail:
 
 ```bash
-snort search "powershell" --sealed-dir sealed --wal-dir wal
+snort search "powershell" --sealed-dir ./snort_data/sealed --wal-dir ./snort_data/wal
 ```
 
 hybrid bm25 full-text search with structured filter:
 
 ```bash
-snort search "powershell" --sealed-dir sealed --bm25 --filter "host = 'ws-2'"
+snort search "powershell" --sealed-dir ./snort_data/sealed --wal-dir ./snort_data/wal --bm25 --filter "host = 'ws-2'"
 ```
 
 ### 6. verify store integrity
 
 ```bash
-snort verify --wal-dir wal --sealed-dir sealed
+snort verify --wal-dir ./snort_data/wal --sealed-dir ./snort_data/sealed
 snort verify-ledger bench/results/demo/ledger.jsonl
 ```
 

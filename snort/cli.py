@@ -16,37 +16,117 @@ from pathlib import Path
 
 
 def _cmd_ingest(args: argparse.Namespace) -> int:
-    from snort.ingest.events import normalize_event
     from snort.ingest.readers import iter_cta_json, iter_e3_jsonl, iter_jsonl
-    from snort.ingest.wal import WalWriter
+    from snort.server import SnortStoreManager
 
     readers = {"cta": iter_cta_json, "e3": iter_e3_jsonl, "jsonl": iter_jsonl}
-    if args.format not in readers:
-        print(f"unknown format {args.format!r}; choose from {sorted(readers)}", file=sys.stderr)
-        return 2
-    count = 0
-    with WalWriter(args.wal_dir, max_bytes=args.max_bytes) as wal:
+    base = (
+        Path(args.data_dir)
+        if args.data_dir
+        else Path(args.wal_dir or "wal").resolve().parent
+    )
+    source = args.source_id or "file:" + str(Path(args.input).resolve())
+    total, duplicates, batch = 0, 0, []
+    from contextlib import nullcontext
+
+    store_context = (
+        nullcontext(None)
+        if args.server
+        else SnortStoreManager(base, wal_dir=args.wal_dir, max_bytes=args.max_bytes)
+    )
+
+    def commit(records, store):
+        if store is not None:
+            return store.ingest(records, source=source)
+        import urllib.request
+
+        req = urllib.request.Request(
+            args.server.rstrip("/") + "/ingest",
+            data=json.dumps(records).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=60) as response:
+            return json.loads(response.read())
+
+    with store_context as store:
         for raw in readers[args.format](args.input):
-            wal.append(normalize_event(raw))
-            count += 1
-        wal.roll()
-    print(json.dumps({"ingested": count, "wal_dir": str(args.wal_dir)}))
+            raw = dict(
+                raw, source_id=source + ":" + str(raw.get("source_id", "generic"))
+            )
+            batch.append(raw)
+            if len(batch) == 1000:
+                result = commit(batch, store)
+                total += result["ingested"]
+                duplicates += result["duplicates"]
+                batch = []
+        if batch:
+            result = commit(batch, store)
+            total += result["ingested"]
+            duplicates += result["duplicates"]
+        print(
+            json.dumps(
+                {
+                    "ingested": total,
+                    "duplicates": duplicates,
+                    "store": args.server or str(store.data_dir),
+                }
+            )
+        )
+    return 0
+
+
+def _cmd_query(args: argparse.Namespace) -> int:
+    import sqlite3
+    from snort.runtime import snapshot_tables
+    from snort.store.search import query_tables
+
+    db_path = Path(args.data_dir).resolve() / "runtime.sqlite3"
+    with sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True) as db:
+        db.execute("BEGIN")
+        sql = (
+            args.sql
+            if args.subcommand == "query"
+            else "SELECT * FROM " + args.subcommand
+        )
+        print(
+            json.dumps(
+                query_tables(sql, snapshot_tables(db), limit=args.limit), indent=2
+            )
+        )
     return 0
 
 
 def _cmd_seal(args: argparse.Namespace) -> int:
-    from snort.store.seal import seal_segments
+    from snort.server import SnortStoreManager
 
-    entries = seal_segments(args.wal_dir, args.sealed_dir)
-    print(json.dumps({"sealed": [e["name"] for e in entries], "count": sum(e["count"] for e in entries)}))
+    base = args.data_dir or Path(args.wal_dir).resolve().parent
+    with SnortStoreManager(
+        base, wal_dir=args.wal_dir, sealed_dir=args.sealed_dir
+    ) as store:
+        entries = store.seal()
+    print(
+        json.dumps(
+            {
+                "sealed": [e["name"] for e in entries],
+                "count": sum(e["count"] for e in entries),
+            }
+        )
+    )
     return 0
 
 
 def _cmd_index(args: argparse.Namespace) -> int:
     from snort.store.index import build_index
+    from snort.server import SnortStoreManager
 
-    entries = build_index(args.sealed_dir, args.index_dir, args.work_dir, backend=args.backend)
-    print(json.dumps({"indexed": [e["segment"] for e in entries], "backend": args.backend}))
+    base = args.data_dir or Path(args.sealed_dir).resolve().parent
+    with SnortStoreManager(
+        base, sealed_dir=args.sealed_dir, index_dir=args.index_dir
+    ) as store:
+        entries = build_index(
+            store.sealed_dir, store.index_dir, args.work_dir, backend=args.backend
+        )
+    print(json.dumps({"indexed": [e["segment"] for e in entries], "backend": "lance"}))
     return 0
 
 
@@ -67,7 +147,9 @@ def _cmd_search(args: argparse.Namespace) -> int:
     else:
         for match in matches:
             score_str = f" (score={match['_score']:.3f})" if "_score" in match else ""
-            print(f"{match['_segment']}:{match.get('_row', 0)} [{match['_source']}]{score_str} {match['raw'][:200]}")
+            print(
+                f"{match['_segment']}:{match.get('_row', 0)} [{match['_source']}]{score_str} {match['raw'][:200]}"
+            )
         print(f"{len(matches)} match(es)", file=sys.stderr)
     return 0
 
@@ -91,19 +173,51 @@ def _cmd_demo_ingest(args: argparse.Namespace) -> int:
     from snort.store.search import search
     from snort.store.seal import seal_segments
 
-    base = Path(tempfile.mkdtemp(prefix="snort-demo-")) if not args.dir else Path(args.dir)
+    base = (
+        Path(tempfile.mkdtemp(prefix="snort-demo-")) if not args.dir else Path(args.dir)
+    )
     wal_dir, sealed_dir, index_dir = base / "wal", base / "sealed", base / "index"
     rows = [
-        ("2024-01-01T00:00:01+00:00", "web-1", "e3-cadets", "nginx: connection from 10.10.34.20:72349"),
-        ("2024-01-01T00:00:02+00:00", "web-1", "e3-cadets", "nginx: connection from 10.10.34.22:50010"),
-        ("2024-01-01T00:01:00+00:00", "ws-2", "cta", "powershell -enc SQBuAHYAbwBrAGUALQBMAG8AZwBnAGkAbgBnAA=="),
-        ("2024-01-01T00:02:00+00:00", "web-1", "e3-cadets", "src: /10.10.34.22 sshd login failed"),
+        (
+            "2024-01-01T00:00:01+00:00",
+            "web-1",
+            "e3-cadets",
+            "nginx: connection from 10.10.34.20:72349",
+        ),
+        (
+            "2024-01-01T00:00:02+00:00",
+            "web-1",
+            "e3-cadets",
+            "nginx: connection from 10.10.34.22:50010",
+        ),
+        (
+            "2024-01-01T00:01:00+00:00",
+            "ws-2",
+            "cta",
+            "powershell -enc SQBuAHYAbwBrAGUALQBMAG8AZwBnAGkAbgBnAA==",
+        ),
+        (
+            "2024-01-01T00:02:00+00:00",
+            "web-1",
+            "e3-cadets",
+            "src: /10.10.34.22 sshd login failed",
+        ),
     ]
     with WalWriter(wal_dir, max_bytes=10**6) as wal:
         for i, (ts, host, source, raw) in enumerate(rows):
-            wal.append(normalize_event(
-                {"ts": ts, "host": host, "action": "log", "object": raw, "raw": raw,
-                 "source_id": source, "source_seq": i}))
+            wal.append(
+                normalize_event(
+                    {
+                        "ts": ts,
+                        "host": host,
+                        "action": "log",
+                        "object": raw,
+                        "raw": raw,
+                        "source_id": source,
+                        "source_seq": i,
+                    }
+                )
+            )
         wal.roll()
     sealed = seal_segments(wal_dir, sealed_dir)
     indexed = build_index(sealed_dir, index_dir)
@@ -276,12 +390,12 @@ def run_verify(ledger_path: str) -> tuple[bool, list[str]]:
 
 
 def _cmd_demo_v1(args: argparse.Namespace) -> int:
-    from snort import __version__
-
     summary = run_demo(args.out, seeds=args.seeds, budget=args.budget)
-    print(f"snort demo v{summary['version']}: "
-          f"{summary['n_traces']} traces, {summary['n_groups']} groups, "
-          f"{summary['n_unassigned']} unassigned")
+    print(
+        f"snort demo v{summary['version']}: "
+        f"{summary['n_traces']} traces, {summary['n_groups']} groups, "
+        f"{summary['n_unassigned']} unassigned"
+    )
     print(f"verify: {'OK' if summary['verify_ok'] else 'FAIL'}")
     for d in summary["decisions"][:10]:
         print(f"  {d['group']}: {d['decision']}")
@@ -298,27 +412,77 @@ def _cmd_verify_ledger(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def _cmd_serve(args: argparse.Namespace) -> int:
+    from snort.server import run_server
+
+    run_server(
+        data_dir=args.data_dir,
+        host=args.host,
+        port=args.port,
+        open_browser=getattr(args, "open", False),
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="snort", description=__doc__)
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser = argparse.ArgumentParser(
+        prog="snort",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="subcommand")
+
+    serve = sub.add_parser(
+        "serve", help="launch embedded web dashboard and network ingest sink"
+    )
+    serve.add_argument(
+        "--data-dir",
+        default="./snort_data",
+        help="storage directory (default: ./snort_data)",
+    )
+    serve.add_argument(
+        "--host", default="127.0.0.1", help="listen host (default: 127.0.0.1)"
+    )
+    serve.add_argument(
+        "--port", type=int, default=8080, help="listen port (default: 8080)"
+    )
+    serve.add_argument(
+        "--open", action="store_true", help="open web dashboard in default browser"
+    )
+    serve.set_defaults(func=_cmd_serve)
 
     ingest = sub.add_parser("ingest", help="append reader output to the WAL")
-    ingest.add_argument("input", help="input file (CTA JSON, E3 JSONL export, or generic JSONL)")
+    ingest.add_argument(
+        "input", help="input file path (e.g. data_with_sclc.json or edges.jsonl)"
+    )
     ingest.add_argument("--format", default="jsonl", choices=["cta", "e3", "jsonl"])
-    ingest.add_argument("--wal-dir", default="wal", help="WAL directory")
+    ingest.add_argument("--wal-dir", default=None)
+    ingest.add_argument("--data-dir", default=None)
+    ingest.add_argument(
+        "--source-id",
+        default=None,
+        help="stable source namespace for resumable ingestion",
+    )
+    ingest.add_argument(
+        "--server", default=None, help="send batches to a running HTTP service"
+    )
     ingest.add_argument("--max-bytes", type=int, default=256 * 1024 * 1024)
     ingest.set_defaults(func=_cmd_ingest)
 
-    seal = sub.add_parser("seal", help="seal WAL segments to Parquet")
+    seal = sub.add_parser("seal", help="seal WAL segments to Lance")
     seal.add_argument("--wal-dir", default="wal")
     seal.add_argument("--sealed-dir", default="sealed")
+    seal.add_argument("--data-dir", default=None)
     seal.set_defaults(func=_cmd_seal)
 
     index = sub.add_parser("index", help="batch-index sealed segments")
     index.add_argument("--sealed-dir", default="sealed")
     index.add_argument("--index-dir", default="index")
     index.add_argument("--work-dir", default=None)
-    index.add_argument("--backend", default="auto", choices=["auto", "builtin", "logcloud"])
+    index.add_argument("--data-dir", default=None)
+    index.add_argument(
+        "--backend", default="auto", choices=["auto", "lance", "builtin"]
+    )
     index.set_defaults(func=_cmd_index)
 
     search = sub.add_parser("search", help="split-and-verify evidence search")
@@ -327,8 +491,16 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--index-dir", default="index")
     search.add_argument("--wal-dir", default="wal")
     search.add_argument("--limit", type=int, default=1000)
-    search.add_argument("--bm25", action="store_true", help="rank results with Lance BM25 full-text scoring")
-    search.add_argument("--filter", default=None, help="additional boolean filter expression (e.g. host = 'h1')")
+    search.add_argument(
+        "--bm25",
+        action="store_true",
+        help="rank results with Lance BM25 full-text scoring",
+    )
+    search.add_argument(
+        "--filter",
+        default=None,
+        help="additional boolean filter expression (e.g. host = 'h1')",
+    )
     search.add_argument("--json", action="store_true")
     search.set_defaults(func=_cmd_search)
 
@@ -337,7 +509,9 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--sealed-dir", default="sealed")
     verify.set_defaults(func=_cmd_verify)
 
-    verify_ledger = sub.add_parser("verify-ledger", help="recompute a decision ledger hash chain")
+    verify_ledger = sub.add_parser(
+        "verify-ledger", help="recompute a decision ledger hash chain"
+    )
     verify_ledger.add_argument("ledger", help="path to ledger.jsonl")
     verify_ledger.set_defaults(func=_cmd_verify_ledger)
 
@@ -347,16 +521,47 @@ def build_parser() -> argparse.ArgumentParser:
     demo.add_argument("--budget", type=int, default=400, help="comparison budget")
     demo.set_defaults(func=_cmd_demo_v1)
 
-    demo_ingest = sub.add_parser("demo-ingest", help="tiny ingest-level replay on synthetic data")
-    demo_ingest.add_argument("--dir", default=None, help="store directory (default: temp dir)")
+    demo_ingest = sub.add_parser(
+        "demo-ingest", help="tiny ingest-level replay on synthetic data"
+    )
+    demo_ingest.add_argument(
+        "--dir", default=None, help="store directory (default: temp dir)"
+    )
     demo_ingest.set_defaults(func=_cmd_demo_ingest)
+
+    query = sub.add_parser(
+        "query", help="read-only SQL over events and live grouping tables"
+    )
+    query.add_argument("sql")
+    query.add_argument("--data-dir", default="./snort_data")
+    query.add_argument("--limit", type=int, default=1000)
+    query.set_defaults(func=_cmd_query)
+    for name in ("groups", "traces"):
+        command = sub.add_parser(name, help="inspect persisted " + name)
+        command.add_argument("--data-dir", default="./snort_data")
+        command.add_argument("--limit", type=int, default=1000)
+        command.set_defaults(func=_cmd_query)
 
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    return args.func(args)
+    parser = build_parser()
+    if argv is None and len(sys.argv) == 1:
+        # Default to launching plug-and-play web server and ingest sink
+        return _cmd_serve(parser.parse_args(["serve"]))
+    args = parser.parse_args(argv)
+    if not hasattr(args, "func"):
+        parser.print_help()
+        return 0
+    try:
+        return args.func(args)
+    except Exception as exc:
+        print(
+            json.dumps({"ok": False, "error": type(exc).__name__, "message": str(exc)}),
+            file=sys.stderr,
+        )
+        return 1
 
 
 if __name__ == "__main__":

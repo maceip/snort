@@ -1,9 +1,12 @@
-"""Search over sealed Lance datasets and WAL tail using DuckDB and Lance native FTS."""
+"""Consistent sealed/live searches and bounded read-only SQL analytics."""
 
 from __future__ import annotations
 
 import json
 import re
+import math
+from datetime import date, datetime, time
+from decimal import Decimal
 from pathlib import Path
 
 import duckdb
@@ -11,249 +14,296 @@ import lance
 import pyarrow as pa
 
 from snort.ingest.events import EVENT_COLUMNS
-from snort.ingest.wal import WalReader, _read_lines
+from snort.errors import RequestError
+from snort.ingest.wal import WalReader
 from snort.store.index import indexed_segments
 
 BOUNDARY_RE = re.compile(r"[\s:;,=()\[\]{}\"']+")
+EVENT_SCHEMA = pa.schema(
+    [(c, pa.int64() if c == "source_seq" else pa.string()) for c in EVENT_COLUMNS]
+)
+RESULT_SCHEMA = pa.schema(
+    list(EVENT_SCHEMA)
+    + [
+        pa.field("_row", pa.int64()),
+        pa.field("_segment", pa.string()),
+        pa.field("_source", pa.string()),
+        pa.field("_search_mode", pa.string()),
+        pa.field("_score", pa.float64()),
+    ]
+)
+SELECT_RESULT = ", ".join(
+    ["ts_original AS ts"]
+    + EVENT_COLUMNS[1:]
+    + ["_row", "_segment", "_source", "_search_mode", "_score"]
+)
 
 
-def split_query(query: str) -> list[str]:
-    """Split a query into parts, longest first."""
-    if not query or not query.strip():
-        raise ValueError("search query must not be empty")
-    parts = [part for part in BOUNDARY_RE.split(query.strip()) if part]
+def json_value(value):
+    if isinstance(value, (datetime, date, time)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, bytes):
+        return value.hex()
+    if isinstance(value, (list, tuple)):
+        return [json_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): json_value(item) for key, item in value.items()}
+    if isinstance(value, float) and not math.isfinite(value):
+        raise RequestError("query produced a non-finite numeric result")
+    return value
+
+
+def unranked(rows):
+    return [
+        {key: value for key, value in row.items() if key != "_score"} for row in rows
+    ]
+
+
+def split_query(query):
+    if not isinstance(query, str) or not query.strip():
+        raise RequestError("search query must not be empty")
+    parts = [p for p in BOUNDARY_RE.split(query.strip()) if p]
     if not parts:
-        raise ValueError(f"query has no searchable parts: {query!r}")
+        raise RequestError("query has no searchable parts")
     return sorted(parts, key=len, reverse=True)
 
 
-def _duckdb_con() -> duckdb.DuckDBPyConnection:
-    con = duckdb.connect()
+def _duckdb_con():
+    con = duckdb.connect(config={"TimeZone": "UTC"})
     try:
-        con.execute("LOAD lance;")
-    except Exception:
-        con.execute("INSTALL lance; LOAD lance;")
+        con.execute("LOAD lance")
+    except duckdb.Error:
+        try:
+            con.execute("INSTALL lance; LOAD lance")
+        except Exception:
+            con.close()
+            raise
     return con
 
 
-def _iter_wal_envelopes(path: Path):
-    for line in _read_lines(path):
-        line = line.strip()
-        if line:
-            yield json.loads(line)
+def _readonly_con():
+    con = duckdb.connect(config={"memory_limit": "256MB", "threads": 2})
+    try:
+        # Initialize DuckDB's timezone extension before disabling extension/file
+        # access. Only trusted setup SQL runs while external access is enabled.
+        con.execute("SET TimeZone = 'UTC'")
+        con.execute("SET enable_external_access = false")
+        return con
+    except Exception:
+        con.close()
+        raise
 
 
-def _collect_wal_records(wal_dir: Path, sealed_wal_names: set[str], query_str: str | None = None) -> list[dict]:
-    """Collect unsealed WAL events as records."""
-    if not wal_dir.exists():
-        return []
-    reader = WalReader(wal_dir)
-    wal_records = []
-    for path in reader.segment_paths():
+def _sealed_entries(sealed_dir):
+    path = Path(sealed_dir) / "sealed-manifest.json"
+    return json.loads(path.read_text())["segments"] if path.exists() else []
+
+
+def _collect_wal_records(wal_dir, sealed_wal_names, query_str=None):
+    records = []
+    if not Path(wal_dir).exists():
+        return records
+    from snort.ingest.wal import _read_lines
+
+    for path in WalReader(wal_dir).segment_paths():
         if path.name in sealed_wal_names:
             continue
-        for row, envelope in enumerate(_iter_wal_envelopes(path)):
-            event = envelope.get("event", {})
-            raw = str(event.get("raw", ""))
-            if query_str is not None and query_str not in raw:
+        for row, line in enumerate(_read_lines(path)):
+            if not line.strip():
                 continue
-            rec = {name: event.get(name, "") for name in EVENT_COLUMNS}
-            rec["_row"] = row
-            rec["_segment"] = path.name
-            rec["_source"] = "wal"
-            wal_records.append(rec)
-    return wal_records
+            event = json.loads(line)["event"]
+            if query_str is not None and query_str not in event["raw"]:
+                continue
+            records.append(
+                dict(
+                    event,
+                    _row=row,
+                    _segment=path.name,
+                    _source="wal",
+                    _search_mode="substring",
+                    _score=0.5,
+                )
+            )
+    return records
+
+
+def _filter_rows(records, filter_expr=None, query=None, limit=1000):
+    with _readonly_con() as con:
+        con.register("events", pa.Table.from_pylist(records, schema=RESULT_SCHEMA))
+        clauses, params = [], []
+        if query is not None:
+            clauses.append("contains(raw, ?)")
+            params.append(query)
+        if filter_expr:
+            clauses.append(f"({filter_expr})")
+        sql = (
+            f"SELECT {SELECT_RESULT} FROM (SELECT * EXCLUDE(ts), ts AS ts_original, CAST(ts AS TIMESTAMPTZ) AS ts FROM events)"
+            + (" WHERE " + " AND ".join(clauses) if clauses else "")
+            + " LIMIT ?"
+        )
+        params.append(limit)
+        try:
+            statements = con.extract_statements(sql)
+            if len(statements) != 1 or statements[0].type.name != "SELECT":
+                raise RequestError("filter must be a single SQL expression")
+            cursor = con.execute(sql, params)
+            return [
+                dict(zip([d[0] for d in cursor.description], row))
+                for row in cursor.fetchall()
+            ]
+        except duckdb.Error as exc:
+            raise RequestError(f"invalid filter: {exc}") from exc
 
 
 def search_bm25(
-    query: str,
-    sealed_dir: str | Path,
-    index_dir: str | Path | None = None,
-    wal_dir: str | Path | None = None,
-    filter_expr: str | None = None,
-    *,
-    limit: int = 1000,
-) -> list[dict]:
-    """Hybrid BM25 full-text search with Lance native FTS relevance scoring and exact boolean filters."""
+    query, sealed_dir, index_dir=None, wal_dir=None, filter_expr=None, *, limit=1000
+):
     return search(
         query,
         sealed_dir,
         index_dir,
         wal_dir,
+        filter_expr=filter_expr,
         limit=limit,
         bm25=True,
-        filter_expr=filter_expr,
     )
 
 
 def search(
-    query: str,
-    sealed_dir: str | Path,
-    index_dir: str | Path | None = None,
-    wal_dir: str | Path | None = None,
+    query,
+    sealed_dir,
+    index_dir=None,
+    wal_dir=None,
     *,
-    limit: int = 1000,
-    bm25: bool = False,
-    filter_expr: str | None = None,
-) -> list[dict]:
-    """Search for query across sealed Lance segments and the unsealed WAL tail.
-
-    Implements:
-    1. Dynamic DuckDB Unified View: executes a single UNION ALL query across all sealed
-       Lance segments and in-memory unsealed WAL buffer for parallelized SIMD scans.
-    2. Hybrid BM25 Scoring (bm25=True): uses Lance's native full-text scanner with
-       relevance scoring (_score) and exact boolean filters.
-    """
-    split_query(query)  # validate eagerly
-    query_str = query.strip()
+    limit=1000,
+    bm25=False,
+    filter_expr=None,
+):
+    split_query(query)
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 10000:
+        raise RequestError("limit must be between 1 and 10000")
+    # Validate even on empty stores and never reinterpret malformed filters as no matches.
+    _filter_rows([], filter_expr)
+    query = query.strip()
     sealed_dir = Path(sealed_dir)
-
-    indexed = set()
-    if index_dir is not None:
-        idx_p = Path(index_dir)
-        if idx_p.exists():
-            indexed = set(indexed_segments(idx_p).keys())
-
-    manifest_path = sealed_dir / "sealed-manifest.json"
-    sealed = []
-    if manifest_path.exists():
-        try:
-            sealed = json.loads(manifest_path.read_text(encoding="utf-8")).get("segments", [])
-        except Exception:
-            pass
-
-    sealed_wal_names = {seg["wal_segment"] for seg in sealed if "wal_segment" in seg}
-
-    # Branch 1: Hybrid BM25 Full-Text Search via Lance Native Scanner
-    if bm25:
-        results: list[dict] = []
-        for seg in sealed:
-            seg_path = sealed_dir / seg["name"]
-            if not seg_path.exists():
-                continue
-            is_indexed = seg["name"] in indexed
-            source_tag = "index" if is_indexed else "scan"
-            try:
-                ds = lance.dataset(str(seg_path))
-                scanner = ds.scanner(
-                    full_text_query=query_str,
-                    filter=filter_expr,
-                    limit=limit,
-                )
-                tbl = scanner.to_table()
-                pydict = tbl.to_pydict()
-                scores = pydict.get("_score", [1.0] * len(tbl))
-                names = tbl.column_names
-                for i in range(len(tbl)):
-                    rec = {c: pydict[c][i] for c in names if c in EVENT_COLUMNS}
-                    rec["_segment"] = seg["name"]
-                    rec["_source"] = source_tag
-                    rec["_row"] = i
-                    rec["_score"] = float(scores[i])
-                    results.append(rec)
-            except Exception:
-                tbl = lance.dataset(str(seg_path)).to_table()
-                raws = tbl.column("raw").to_pylist()
-                for idx, raw in enumerate(raws):
-                    if query_str in str(raw):
-                        rec = {c: tbl.column(c)[idx].as_py() for c in EVENT_COLUMNS}
-                        rec["_segment"] = seg["name"]
-                        rec["_source"] = source_tag
-                        rec["_row"] = idx
-                        rec["_score"] = 0.5
-                        results.append(rec)
-
-        if wal_dir is not None:
-            wal_records = _collect_wal_records(Path(wal_dir), sealed_wal_names, query_str=query_str)
-            for r in wal_records:
-                r["_score"] = 0.5
-                results.append(r)
-
-        results.sort(key=lambda x: x.get("_score", 0.0), reverse=True)
-        return results[:limit]
-
-    # Branch 2: Dynamic DuckDB Unified View
-    wal_records = []
-    if wal_dir is not None:
-        wal_records = _collect_wal_records(Path(wal_dir), sealed_wal_names, query_str=None)
-
-    valid_sealed = [s for s in sealed if (sealed_dir / s["name"]).exists()]
-    if not valid_sealed and not wal_records:
-        return []
-
-    con = _duckdb_con()
-    subqueries = []
-    cols_str = ", ".join(EVENT_COLUMNS)
-
-    for seg in valid_sealed:
-        seg_path = (sealed_dir / seg["name"]).as_posix()
-        is_indexed = seg["name"] in indexed
-        source_tag = "index" if is_indexed else "scan"
-        subqueries.append(f"""
-            SELECT {cols_str},
-                   '{seg["name"]}' AS _segment,
-                   '{source_tag}' AS _source,
-                   (row_number() OVER () - 1) AS _row
-            FROM '{seg_path}'
-        """)
-
-    if wal_records:
-        wal_tbl = pa.Table.from_pylist(wal_records)
-        con.register("wal_buffer", wal_tbl)
-        subqueries.append(f"""
-            SELECT {cols_str},
-                   _segment,
-                   _source,
-                   _row
-            FROM wal_buffer
-        """)
-
-    where_clauses = ["raw LIKE ?"]
-    params: list = [f"%{query_str}%"]
-    if filter_expr:
-        where_clauses.append(f"({filter_expr})")
-
-    unified_sql = f"""
-    SELECT * FROM (
-        {' UNION ALL '.join(subqueries)}
+    sealed = _sealed_entries(sealed_dir)
+    sealed_wal = {s["wal_segment"] for s in sealed}
+    indexed = indexed_segments(Path(index_dir)) if index_dir is not None else {}
+    wal_records = (
+        _collect_wal_records(wal_dir, sealed_wal) if wal_dir is not None else []
     )
-    WHERE {' AND '.join(where_clauses)}
-    LIMIT ?
-    """
-    params.append(limit)
-
-    try:
-        rows = con.execute(unified_sql, params).fetchall()
-        cols = [d[0] for d in con.description]
-        return [dict(zip(cols, r)) for r in rows]
-    except Exception:
-        # Fallback to per-segment scan if unified query encounters an issue
+    if bm25:
         results = []
-        for seg in valid_sealed:
-            seg_path = sealed_dir / seg["name"]
-            is_indexed = seg["name"] in indexed
-            source_tag = "index" if is_indexed else "scan"
-            try:
-                ds = lance.dataset(str(seg_path))
-                tbl = ds.to_table()
-                raws = tbl.column("raw").to_pylist()
-                for idx, raw in enumerate(raws):
-                    if query_str in str(raw):
-                        m = {c: tbl.column(c)[idx].as_py() for c in EVENT_COLUMNS}
-                        m["_segment"] = seg["name"]
-                        m["_source"] = source_tag
-                        m["_row"] = idx
-                        results.append(m)
-                        if len(results) >= limit:
-                            break
-            except Exception:
-                pass
-            if len(results) >= limit:
-                break
-        if len(results) < limit and wal_records:
-            for r in wal_records:
-                if query_str in str(r.get("raw", "")):
-                    results.append(r)
-                    if len(results) >= limit:
-                        break
-        return results
+        for seg in sealed:
+            ds = lance.dataset(str(sealed_dir / seg["name"]))
+            has_fts = any(i.name == "raw_idx" for i in ds.describe_indices())
+            if has_fts:
+                # Filter through DuckDB below for identical SQL semantics on sealed/live data.
+                table = ds.scanner(full_text_query=query, with_row_id=True).to_table()
+                for row in table.to_pylist():
+                    results.append(
+                        dict(
+                            {c: row[c] for c in EVENT_COLUMNS},
+                            _row=int(row["_rowid"]),
+                            _segment=seg["name"],
+                            _source="index",
+                            _search_mode="bm25",
+                            _score=float(row["_score"]),
+                        )
+                    )
+            else:
+                for offset, event in enumerate(ds.to_table().to_pylist()):
+                    if query in event["raw"]:
+                        results.append(
+                            dict(
+                                event,
+                                _row=offset,
+                                _segment=seg["name"],
+                                _source="scan",
+                                _search_mode="substring-fallback",
+                                _score=0.5,
+                            )
+                        )
+        results.extend(r for r in wal_records if query in r["raw"])
+        filtered = _filter_rows(results, filter_expr, limit=max(len(results), 1))
+        filtered.sort(key=lambda r: (-r["_score"], r["event_hash"]))
+        return filtered[:limit]
+
+    if not sealed:
+        return unranked(_filter_rows(wal_records, filter_expr, query, limit))
+    # Keep the Lance/DuckDB unified scan; do not silently drop failed segments or predicates.
+    try:
+        con = _duckdb_con()
+    except duckdb.Error:
+        import logging
+
+        logging.warning(
+            "DuckDB Lance extension unavailable; using explicit Arrow scan fallback"
+        )
+        records = list(wal_records)
+        for seg in sealed:
+            ds = lance.dataset(str(sealed_dir / seg["name"]))
+            records.extend(
+                dict(
+                    event,
+                    _row=i,
+                    _segment=seg["name"],
+                    _source="scan",
+                    _search_mode="arrow-substring-fallback",
+                    _score=0.5,
+                )
+                for i, event in enumerate(ds.to_table().to_pylist())
+            )
+        return unranked(_filter_rows(records, filter_expr, query, limit))
+    with con:
+        con.register(
+            "wal_buffer", pa.Table.from_pylist(wal_records, schema=RESULT_SCHEMA)
+        )
+        parts = ["SELECT * FROM wal_buffer"]
+        for seg in sealed:
+            path = str(sealed_dir / seg["name"]).replace("'", "''")
+            name = seg["name"].replace("'", "''")
+            source = "index" if seg["name"] in indexed else "scan"
+            parts.append(
+                f"SELECT {', '.join(EVENT_COLUMNS)}, row_number() OVER () - 1 AS _row, "
+                f"'{name}' AS _segment, '{source}' AS _source, 'substring' AS _search_mode, 0.5 AS _score FROM '{path}'"
+            )
+        where = "contains(raw, ?)" + (f" AND ({filter_expr})" if filter_expr else "")
+        sql = f"SELECT {SELECT_RESULT} FROM (SELECT * EXCLUDE(ts), ts AS ts_original, CAST(ts AS TIMESTAMPTZ) AS ts FROM ({' UNION ALL '.join(parts)})) WHERE {where} LIMIT ?"
+        cursor = con.execute(sql, [query, limit])
+        return unranked(
+            [
+                dict(zip([d[0] for d in cursor.description], row))
+                for row in cursor.fetchall()
+            ]
+        )
+
+
+def query_tables(sql, tables, *, limit=1000):
+    """Read-only SQL on registered Arrow snapshots, without external file access."""
+    if not isinstance(sql, str) or not sql.strip():
+        raise RequestError("sql must be a nonempty SELECT query")
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 10000:
+        raise RequestError("limit must be between 1 and 10000")
+    with _readonly_con() as con:
+        for name, table in tables.items():
+            con.register(name, table)
+        try:
+            statements = con.extract_statements(sql)
+            if len(statements) != 1 or statements[0].type.name != "SELECT":
+                raise RequestError("only one read-only SELECT statement is allowed")
+            cursor = con.execute(
+                f"SELECT * FROM ({sql.strip().rstrip(';')}) AS result LIMIT ?", [limit]
+            )
+            # Arrow uses standard timezone objects; DuckDB's Python row conversion
+            # otherwise requires an undeclared pytz dependency for TIMESTAMPTZ.
+            arrow = (
+                cursor.to_arrow_table()
+                if hasattr(cursor, "to_arrow_table")
+                else cursor.fetch_arrow_table()
+            )
+            return [json_value(row) for row in arrow.to_pylist()]
+        except duckdb.Error as exc:
+            raise RequestError(f"invalid SQL query: {exc}") from exc
