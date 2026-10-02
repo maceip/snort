@@ -28,7 +28,14 @@ Environment: 4-core cloud container, Python 3.13 via `uv`. `jev-sec/jev-ids@6aa5
 
 ## Verdict
 
-Not used. It could later be wrapped as an optional per-event detector, behind the same baseline comparison as VELOX, if a paid external call per event were ever acceptable on the live path.
+Not used, in any role. No code, model, prompt format, dataset (NSL-KDD), metric or evaluation method from jev-ids is part of this plan, and it is not kept as a future option or as a baseline.
+
+**Why:**
+- **Nothing to reproduce:** its detector is a closed, paid API.
+- **A weak comparison:** its headline result is against a random forest trained on 5 examples.
+- **The wrong task:** it classifies single flows from a dated benchmark, which none of the plan's six stages need.
+
+Only its table was recomputed, from the prediction files it ships; the detector itself was never re-run.
 
 ## Reproduce
 
