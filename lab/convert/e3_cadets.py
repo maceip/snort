@@ -153,6 +153,8 @@ def convert_e3(
 
     es.to_parquet(events, os.path.join(out_dir, "events.parquet"))
     es.to_parquet(traces, os.path.join(out_dir, "traces.parquet"))
+    es.to_lance(events, os.path.join(out_dir, "events.lance"))
+    es.to_lance(traces, os.path.join(out_dir, "traces.lance"))
     es.dump_json(manifest, os.path.join(out_dir, "manifest.json"))
     es.dump_json({"split": "incident-time-forward", **manifest_splits},
                  os.path.join(out_dir, "splits.json"))

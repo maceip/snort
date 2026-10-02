@@ -191,6 +191,8 @@ def convert_cta(
     }
     es.to_parquet(events.drop(columns=["raw_text"]), os.path.join(out_dir, "events.parquet"))
     es.to_parquet(traces, os.path.join(out_dir, "traces.parquet"))
+    es.to_lance(events.drop(columns=["raw_text"]), os.path.join(out_dir, "events.lance"))
+    es.to_lance(traces, os.path.join(out_dir, "traces.lance"))
     es.dump_json(manifest, os.path.join(out_dir, "manifest.json"))
     es.dump_json({"per_actor_time_forward": per_actor, "open_set": open_set},
                  os.path.join(out_dir, "splits.json"))

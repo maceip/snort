@@ -1,9 +1,7 @@
-"""Seal WAL segments to zstd Parquet (plan section 4.1).
+"""Seal WAL segments to Lance datasets (plan section 4.1).
 
-Each hour (or 256 MB) the WAL is written to Parquet files we control.
-Columns are the Event schema (``EVENT_COLUMNS``); files use zstd
-compression with 100k-row row groups so the search wrapper can read
-only the row groups that hold index hits. A ``sealed-manifest.json``
+Each hour (or 256 MB) the WAL is written to Lance datasets we control.
+Columns are the Event schema (``EVENT_COLUMNS``). A ``sealed-manifest.json``
 chains every sealed segment to the previous one, extending the
 tamper-evident lineage from the WAL.
 """
@@ -16,22 +14,32 @@ import os
 from pathlib import Path
 
 import pyarrow as pa
-import pyarrow.parquet as pq
+import lance
 
 from snort.ingest.events import EVENT_COLUMNS
 from snort.ingest.wal import MANIFEST_NAME, _read_lines
 
 SEALED_MANIFEST = "sealed-manifest.json"
-ROW_GROUP_SIZE = 100_000
 
 
 def _sealed_name(seq: int) -> str:
-    return f"seg-{seq:06d}.parquet"
+    return f"seg-{seq:06d}.lance"
 
 
-def _parquet_hash(path: Path) -> str:
-    digest = hashlib.blake3(path.read_bytes()) if hasattr(hashlib, "blake3") else hashlib.sha256(path.read_bytes())
-    return digest.hexdigest()
+def _lance_data_hash(lance_dir: Path) -> str:
+    hasher = hashlib.blake3() if hasattr(hashlib, "blake3") else hashlib.sha256()
+    data_dir = lance_dir / "data"
+    if data_dir.exists():
+        for p in sorted(data_dir.rglob("*")):
+            if p.is_file():
+                hasher.update(p.name.encode("utf-8"))
+                hasher.update(p.read_bytes())
+    else:
+        for p in sorted(lance_dir.rglob("*")):
+            if p.is_file() and "_indices" not in p.parts:
+                hasher.update(p.name.encode("utf-8"))
+                hasher.update(p.read_bytes())
+    return hasher.hexdigest()
 
 
 def _load_manifest(sealed_dir: Path) -> list[dict]:
@@ -41,8 +49,8 @@ def _load_manifest(sealed_dir: Path) -> list[dict]:
     return json.loads(manifest.read_text(encoding="utf-8"))["segments"]
 
 
-def seal_segments(wal_dir: str | Path, sealed_dir: str | Path, *, row_group_size: int = ROW_GROUP_SIZE) -> list[dict]:
-    """Seal every unsealed WAL segment to Parquet. Idempotent.
+def seal_segments(wal_dir: str | Path, sealed_dir: str | Path, *, row_group_size: int = 100_000, **kwargs) -> list[dict]:
+    """Seal every unsealed WAL segment to Lance. Idempotent.
 
     Returns the manifest entries for newly sealed segments.
     """
@@ -77,8 +85,8 @@ def seal_segments(wal_dir: str | Path, sealed_dir: str | Path, *, row_group_size
         table = pa.table({name: pa.array(columns[name]) for name in EVENT_COLUMNS})
         sealed_seq += 1
         out_path = sealed_dir / _sealed_name(sealed_seq)
-        pq.write_table(table, out_path, compression="zstd", row_group_size=row_group_size)
-        root = _parquet_hash(out_path)
+        lance.write_dataset(table, str(out_path), mode="overwrite")
+        root = _lance_data_hash(out_path)
         entry = {
             "seq": sealed_seq,
             "name": out_path.name,
@@ -115,20 +123,21 @@ def verify_sealed_chain(wal_dir: str | Path, sealed_dir: str | Path) -> dict:
             errors.append(f"{entry['name']}: sealed chain link broken")
         path = sealed_dir / entry["name"]
         if not path.exists():
-            errors.append(f"{entry['name']}: missing parquet file")
+            errors.append(f"{entry['name']}: missing lance dataset")
             continue
-        if _parquet_hash(path) != entry["root"]:
-            errors.append(f"{entry['name']}: parquet hash mismatch")
+        if _lance_data_hash(path) != entry["root"]:
+            errors.append(f"{entry['name']}: lance hash mismatch")
         wal_root = wal_roots.get(entry["wal_segment"])
         if wal_root is not None and wal_root != entry["wal_root"]:
             errors.append(f"{entry['name']}: WAL root mismatch")
         try:
-            got = pq.read_metadata(path).num_rows
+            ds = lance.dataset(str(path))
+            got = ds.count_rows()
         except Exception as exc:
-            errors.append(f"{entry['name']}: unreadable parquet: {exc}")
+            errors.append(f"{entry['name']}: unreadable lance dataset: {exc}")
             continue
         if got != entry["count"]:
-            errors.append(f"{entry['name']}: count mismatch (manifest {entry['count']}, parquet {got})")
+            errors.append(f"{entry['name']}: count mismatch (manifest {entry['count']}, lance {got})")
         events += entry["count"]
         prev_root = entry["root"]
     return {"ok": not errors, "segments_checked": len(entries), "events": events, "errors": errors}

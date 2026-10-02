@@ -47,8 +47,8 @@ To ensure rapid delivery without regressions or rabbit holes, agents must strict
 flowchart LR
     subgraph S1["Stage 1: Ingest & Store"]
         RAW[Raw Telemetry] --> WAL[(BLAKE3 WAL)]
-        WAL --> SEAL[(Sealed Parquet)]
-        SEAL --> SRCH[Split-and-Verify Search]
+        WAL --> SEAL[(Sealed Lance Datasets)]
+        SEAL --> SRCH[DuckDB Lance Extension + Native Indexes]
     end
 
     subgraph S2["Stage 2: Represent"]
@@ -84,7 +84,7 @@ flowchart LR
 
 | Stage | Input | Primary Implementation | Output | Fast Baseline |
 | :--- | :--- | :--- | :--- | :--- |
-| **1. Ingest & Store** | Raw JSON / CSV / CDM | [`snort.ingest.wal.WalWriter`](file:///Users/mac/snort/snort/ingest/wal.py), [`snort.store.seal`](file:///Users/mac/snort/snort/store/seal.py) | Sealed Parquet + BLAKE3 hashes | DuckDB scans |
+| **1. Ingest & Store** | Raw JSON / CSV / CDM | [`snort.ingest.wal.WalWriter`](file:///Users/mac/snort/snort/ingest/wal.py), [`snort.store.seal`](file:///Users/mac/snort/snort/store/seal.py) | Sealed Lance + BLAKE3 data hashes | DuckDB + Lance extension (`LOAD lance;`) |
 | **2. Represent** | Normalized events | [`snort.trace.assembler`](file:///Users/mac/snort/snort/trace/assembler.py), [`snort.trace.features`](file:///Users/mac/snort/snort/trace/features.py) | Process subtrees / beacon sessions with MinHash (128) + TF-IDF | Token n-gram counts |
 | **3. Retrieve** | Trace features | [`snort.retrieve.minhash_lsh`](file:///Users/mac/snort/snort/retrieve/minhash_lsh.py), [`third_party.dynahash`](file:///Users/mac/snort/third_party/dynahash/dynahash.py) | Capped candidates ($\le 50$) | Exact indicator matches |
 | **4. Prioritize & Score** | Candidate pairs | [`snort.match.queue`](file:///Users/mac/snort/snort/match/queue.py), [`snort.match.pair_model`](file:///Users/mac/snort/snort/match/pair_model.py) | Calibrated link probabilities $P(\text{same-group})$ | Cosine threshold |

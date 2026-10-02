@@ -70,11 +70,13 @@ def _build_store(base: Path, *, index_first_only=True):
 
 
 def _brute_force(query, sealed_dir, wal_dir):
+    import lance
     expected = []
     manifest = sealed_dir / "sealed-manifest.json"
     sealed = json.loads(manifest.read_text())["segments"] if manifest.exists() else []
     for seg in sealed:
-        table = pq.read_table(sealed_dir / seg["name"], columns=["raw"])
+        ds = lance.dataset(str(sealed_dir / seg["name"]))
+        table = ds.to_table(columns=["raw"])
         for row in range(table.num_rows):
             raw = str(table.column("raw")[row].as_py())
             if query in raw:
@@ -130,9 +132,10 @@ def test_wal_chain_and_tamper(tmp_path):
 
 
 def test_seal_writes_event_columns(tmp_path):
+    import lance
     wal_dir, sealed_dir, _ = _build_store(tmp_path, index_first_only=False)
-    for seg_file in sorted(sealed_dir.glob("seg-*.parquet")):
-        table = pq.read_table(sealed_dir / seg_file)
+    for seg_file in sorted(sealed_dir.glob("seg-*.lance")):
+        table = lance.dataset(str(sealed_dir / seg_file)).to_table()
         assert table.schema.names == EVENT_COLUMNS
     # Idempotent: sealing again seals nothing.
     assert seal_segments(wal_dir, sealed_dir) == []
@@ -169,7 +172,7 @@ def test_verify_store_and_tamper(tmp_path):
     wal_dir, sealed_dir, index_dir = _build_store(tmp_path, index_first_only=False)
     report = verify_store(wal_dir, sealed_dir)
     assert report["ok"], report["errors"]
-    target = sealed_dir / "seg-000001.parquet"
+    target = list((sealed_dir / "seg-000001.lance" / "data").glob("*.lance"))[0]
     data = bytearray(target.read_bytes())
     data[len(data) // 2] ^= 0xFF
     target.write_bytes(bytes(data))

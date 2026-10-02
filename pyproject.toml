@@ -5,20 +5,17 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "snort"
 version = "0.1.0"
-description = "Single-process live event ingestion with tamper-evident lineage (version 1: ingest and search)"
+description = "Single-process live event ingestion with tamper-evident lineage (version 1: Lance store with DuckDB)"
 requires-python = ">=3.10"
 dependencies = [
   "pyarrow>=14",
   "duckdb>=0.9",
   "zstandard>=0.20",
   "blake3>=0.3",
+  "pylance",
 ]
 
 [project.optional-dependencies]
-logcloud = [
-  "rottnest==1.5.0",
-  "getdaft==0.3.15",
-]
 test = ["pytest>=7"]
 
 [project.scripts]

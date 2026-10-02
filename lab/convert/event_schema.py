@@ -67,7 +67,28 @@ def to_parquet(df, path: str) -> None:
     pq.write_table(table, path)
 
 
+def to_lance(df, path: str) -> None:
+    import pyarrow as pa
+    import lance
+
+    for col, dtype in (EVENT_COLUMNS if "event_hash" in df.columns else TRACE_COLUMNS).items():
+        if col not in df.columns:
+            raise ValueError(f"missing required column: {col}")
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    lance.write_dataset(table, path, mode="overwrite")
+
+
+def read_lance(path: str):
+    import lance
+
+    ds = lance.dataset(path)
+    return ds.to_table().to_pandas()
+
+
 def read_parquet(path: str):
+    import os
+    if os.path.isdir(path) or str(path).endswith(".lance"):
+        return read_lance(path)
     import pandas as pd
 
     return pd.read_parquet(path)
