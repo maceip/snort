@@ -32,9 +32,12 @@ Environment: 4-core cloud container, 15 GB RAM, CPU only, Python 3.10 venv (torc
 | Published (Bilot et al., Table 4) | tuned, 5 seeds, GPU | 0.94 mean, 0.77 min | 8 / 0 (best seed) | — |
 | 1 | default `velox.yml`, seed 0 | killed out of memory at 13.6 GB when training started | — | — |
 | 2 | default `velox.yml` (embeddings 128, hidden 128), seed 0, memory patch | **0.008** | 1 / 134 | graphs 4 min, word2vec 20 s, features 3.5 min, 12 epochs about 20 min, evaluation 7 min |
-| 3 | tuned training settings (hidden 256, lr 1e-4, dropout 0.3), embeddings kept at 128 | running | — | |
+| 3 | `main`, the tuned settings from `docs/docs/tuned_systems.md` except embeddings (hidden and output 256, lr 1e-4, dropout 0.3, embeddings kept at 128) | **0.007** | 1 / 180 | about 4.5 min per epoch |
+| 4 | the paper's own `velox` branch (`54f687c`) with `--tuned`, which loads `tuned_baselines/cadets_e3/tuned_velox.yml` (embeddings 64, seed 69, lr 1e-3, output 256) | running | — | |
 
-The tuned CADETS_E3 settings listed in `docs/docs/tuned_systems.md` also set `featurization.emb_dim=256`. That doubles the edge-feature files (6.1 GB at 128 dimensions) and the training memory, and does not fit this 15 GB, 4-core container.
+- **Settings `main` lists:** `docs/docs/tuned_systems.md` gives embeddings 256, lr 1e-4 and hidden 256. That would double the 6.1 GB of edge features and the training memory, which does not fit this container.
+- **Settings the paper used:** the paper links the `velox` branch, not `main`. That branch ships the `tuned_velox.yml` that `main` lacks, with embeddings 64, seed 69, lr 1e-3 and output 256, and a comment recording "ADP@1.00".
+- **So the two disagree:** the settings `main` documents do not match the configuration that produced the published result.
 
 Run 2 detail:
 - Ground truth loads correctly: 72 of 72 attack nodes are found in 9 test windows.
