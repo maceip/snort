@@ -33,7 +33,7 @@ Environment: 4-core cloud container, 15 GB RAM, CPU only, Python 3.10 venv (torc
 | 1 | default `velox.yml`, seed 0 | killed out of memory at 13.6 GB when training started | — | — |
 | 2 | default `velox.yml` (embeddings 128, hidden 128), seed 0, memory patch | **0.008** | 1 / 134 | graphs 4 min, word2vec 20 s, features 3.5 min, 12 epochs about 20 min, evaluation 7 min |
 | 3 | `main`, the tuned settings from `docs/docs/tuned_systems.md` except embeddings (hidden and output 256, lr 1e-4, dropout 0.3, embeddings kept at 128) | **0.007** | 1 / 180 | about 4.5 min per epoch |
-| 4 | the paper's own `velox` branch (`54f687c`) with `--tuned`, which loads `tuned_baselines/cadets_e3/tuned_velox.yml` (embeddings 64, seed 69, lr 1e-3, output 256) | running | — | |
+| 4 | the paper's own `velox` branch (`54f687c`) with `--tuned`, which loads `tuned_baselines/cadets_e3/tuned_velox.yml` (embeddings 64, seed 69, lr 1e-3, output 256); `inference_device` set to CPU | **0.143** (per epoch: 0.019, 0.020, 0.143, 0.041, 0.045) | 0 / 0 at its threshold; catching all attacks would cost 113 FP for 10 TP | about 2–5 min per epoch |
 
 - **Settings `main` lists:** `docs/docs/tuned_systems.md` gives embeddings 256, lr 1e-4 and hidden 256. That would double the 6.1 GB of edge features and the training memory, which does not fit this container.
 - **Settings the paper used:** the paper links the `velox` branch, not `main`. That branch ships the `tuned_velox.yml` that `main` lacks, with embeddings 64, seed 69, lr 1e-3 and output 256, and a comment recording "ADP@1.00".
@@ -46,15 +46,33 @@ Run 2 detail:
 
 ## Findings
 
-1. **The pipeline did not fit in 15 GB.** The training loader keeps train, val and test edge features in memory and then concatenates them into a second full copy (`get_full_data`). Only the TGN last-neighbour loader uses that copy, and VELOX does not use that loader. The first run was killed at 13.6 GB. A two-line patch skips the copy when that loader is off; it does not change results.
+1. **VELOX did not reproduce here.**
+   - **Result:** the best of three configurations reached ADP 0.143, against 0.94 published (mean over 5 seeds, minimum 0.77). The run with the paper's own branch and tuned file records "ADP@1.00".
+   - **Same inputs:** all three runs used the same database and ground truth, and all 72 attack nodes were found.
+   - **What differs from the paper:**
+     - CPU instead of GPU;
+     - one seed per configuration;
+     - for runs 2 and 3, the evolved `main` branch.
+   - **Interpretation:** an ADP of 0.14 is far outside the paper's own seed range, so these differences would have to matter far more than the paper's instability analysis suggests. Until VELOX reproduces, its published number is not evidence this plan can rely on.
+2. **The documentation and the code disagree.** `main` lacks the tuned file that `--tuned` loads. Its documented tuned settings (embeddings 256, lr 1e-4) differ from the paper branch's file (embeddings 64, lr 1e-3). The paper branch also hardcodes `inference_device: cuda` despite `--cpu`, so it crashes after the first epoch unless that setting is overridden.
+3. **The pipeline did not fit in 15 GB.** The training loader keeps train, val and test edge features in memory and then concatenates them into a second full copy (`get_full_data`). Only the TGN last-neighbour loader uses that copy, and VELOX does not use that loader. The first run was killed at 13.6 GB. A two-line patch skips the copy when that loader is off; it does not change results.
 
 ## Verdict
 
-Pending the ADP result.
+- **Kept:**
+  - the dataset dumps, converters and node-level ground truth, which all worked;
+  - the evaluation rules (ADP, at least 5 seeds, no test data in features or thresholds).
+- **Not relied on:** VELOX as the stage-5 anomaly score, until it reproduces.
+- **Plan status:**
+  - **Phase 0:** reproduce VELOX on a GPU machine with 5 seeds from the `velox` branch.
+  - **Fallback:** a simple frequency-based edge-rarity score, measured with the same ADP protocol.
+  - **What stage 5 is seeded from in the meantime:** the anomaly score is one input to prioritization and explanation, not a gate, and reconstruction can also start from strong pair links and indicator hits.
 
 ## Reproduce
 
 ```bash
 ./download_datasets.sh cadets_e3 && pg_restore -d cadets_e3 cadets_e3.dump     # Postgres 18
 PYTHONHASHSEED=0 python pidsmaker/main.py velox CADETS_E3 --cpu --database_host localhost --artifact_dir <dir>
+# paper branch: git worktree add ../PIDSMaker-velox velox; set DB host and ROOT_ARTIFACT_DIR in src/config.py
+PYTHONHASHSEED=0 python src/benchmark.py velox CADETS_E3 --tuned --cpu --detection.gnn_training.inference_device=cpu
 ```

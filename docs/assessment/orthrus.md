@@ -1,6 +1,6 @@
 # Assessment: ORTHRUS (ubc-provenance/orthrus) and its PIDSMaker port
 
-The ORTHRUS repository was cloned and its detection, evaluation and reconstruction code was read. Its reconstruction step (DepImpact) was then run through PIDSMaker's `triage` stage, on top of VELOX detections on DARPA E3-CADETS (see `pidsmaker-velox.md` for the detector). This note records what works, what does not, and what it changes in `docs/plan.md`.
+The ORTHRUS repository was cloned and its detection, evaluation and reconstruction code was read. Running its reconstruction step (DepImpact) through PIDSMaker's `triage` stage on VELOX detections was attempted but did not happen (see Runs). This note records what works, what does not, and what it changes in `docs/plan.md`.
 
 Environment: 4-core cloud container, 15 GB RAM, CPU only. `ubc-provenance/orthrus@e7f25df`, `ubc-provenance/PIDSMaker@ae1e9fd`, Postgres 18 with the E3-CADETS dump (36.5M events).
 
@@ -32,7 +32,7 @@ Environment: 4-core cloud container, 15 GB RAM, CPU only. `ubc-provenance/orthru
    - **Test data picks the operating point:**
      - **What it does:** after thresholding, `compute_kmeans_labels` takes the K highest test-node scores (K = 20 in the repo, 30 in PIDSMaker), splits them into two clusters with k-means, and flags only the higher cluster.
      - **Effect:** the alert count is chosen from the test score distribution and capped at K for the whole test period. The headline precision (CADETS_E3 "ano": 15 TP, 0 FP) is measured under that cap.
-2. **Without those practices, a linear model matches it.** In Bilot et al. (Table 4, E3-CADETS, 5 seeds, test data excluded):
+2. **Without those practices, a linear model matches it, as published.** VELOX did not reproduce here (see `pidsmaker-velox.md`). In Bilot et al. (Table 4, E3-CADETS, 5 seeds, test data excluded):
 
    | Model | ADP mean | ADP min | Mean precision |
    |---|---|---|---|
@@ -56,7 +56,10 @@ Environment: 4-core cloud container, 15 GB RAM, CPU only. `ubc-provenance/orthru
 
 ## Runs
 
-In progress: VELOX with PIDSMaker's DepImpact triage on E3-CADETS (see `pidsmaker-velox.md`).
+ORTHRUS itself was not trained here; its code and configurations were read. The plan was to run DepImpact through PIDSMaker's triage stage on VELOX detections, but it did not run:
+- **The options were ignored:** on `main` the `--triage.*` options were not applied, and no triage step appeared in the log.
+- **No useful starting points:** the detector it would start from did not reproduce. The best VELOX run flagged at most 1 attack node among 135–180 alerts, so reconstruction would mostly have traced benign activity.
+- **Not yet measured:** reconstruction quality (nodes to inspect per attack) is a Phase 0 item, run on whichever anomaly score passes the ADP check.
 
 ## Verdict
 
@@ -66,7 +69,7 @@ In progress: VELOX with PIDSMaker's DepImpact triage on E3-CADETS (see `pidsmake
   - the evaluation rules: node-level, ADP, at least 5 seeds, no test data in features or thresholds.
 - **Not used:** the GNN and the snooped configuration.
 - **Plan status:**
-  - **Anomaly score:** VELOX's per-edge loss (§4.2, §4.5).
+  - **Anomaly score:** VELOX only if it reproduces; otherwise an edge-rarity score (§2.1).
   - **Reconstruction:** stitches windows by following edges across them, uses `degree_recon` scoring, and is reported with nodes-to-inspect per attack.
 
 ## Reproduce

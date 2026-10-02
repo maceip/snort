@@ -53,7 +53,7 @@ Any design that turns similarity directly into a label mislabels at a rate an an
 | 2 Represent | Activity counts, pooled token vectors, MinHash, timing, all mergeable per event | ThreatTrace's pipeline; Tracegram's aggregator | Counts 0.927 vs ThreatTrace 0.915 on its own data; pooled 1-NN ties Tracegram (1.000). Both alternatives recompute in batch |
 | 3 Retrieve | DynaHash (fixed), HNSW and indicators, capped at 50 | BlockingPy's components | Links are 86% pure, components 67%. BlockingPy rebuilds its index on every call |
 | 4 Score | Sorted-neighbourhood scheduling, calibrated pair model | NN + BFS; PESM | PER's own deduplication results favour sorted neighbourhood; PESM does not reproduce |
-| 5 Group, explain | Overlapping memberships from calibrated links; VELOX score; DepImpact reconstruction across windows | Fuzzy c-means; ORTHRUS's GNN | Fuzzy memberships always sum to 1 and added nothing (0.920 without, 0.910 with). VELOX matches ORTHRUS (ADP 0.94) without test-data snooping |
+| 5 Group, explain | Overlapping memberships from calibrated links; an anomaly score that has passed our own ADP check; DepImpact reconstruction across windows | Fuzzy c-means; ORTHRUS's GNN | Fuzzy memberships always sum to 1 and added nothing (0.920 without, 0.910 with). Bilot et al. report VELOX matching ORTHRUS (ADP 0.94) without test-data snooping, but three runs here reached at most 0.14, so no anomaly score is trusted until it passes our own ADP check |
 | 6 Attribute | TF-IDF + logistic regression and ATT&CK retrieval, fused against an explicit unknown actor | The CTA hybrid; LLM-decided attribution (AURA) | TF-IDF beats the hybrid on both splits. AURA has 30 test reports and no evidence weights, so an LLM may explain but not score |
 
 **What is new and unproven.** No paper answers these about the joined loop:
@@ -70,7 +70,7 @@ Phase 0's go/no-go tests answer 1 and 2 within three weeks; Phase 1 answers 3.
 
 **Why one workstation is enough.** Measured on 4 CPU cores:
 - E3-CADETS graphs build in 4 minutes;
-- VELOX trains in about 1.5 minutes per epoch;
+- a VELOX training epoch takes about 1.5 minutes;
 - DynaHash inserts about 1,000 sealed traces per second;
 - LogCloud indexes about 4 MB/s;
 - the CTA classifier trains in seconds.
@@ -101,7 +101,8 @@ Everything in this plan exists to make that command produce honest numbers.
    - dependencies that no longer install or that change results (rottnest, pyJedAI, PIDSMaker's dump format);
    - pipelines that do not run as shipped (ThreatTrace needed six patches);
    - evaluations that use test data or random splits (ORTHRUS, Unveiling-CTAs);
-   - complex models that a simple baseline matches (Unveiling-CTAs, Tracegram, ORTHRUS against VELOX).
+   - complex models that a simple baseline matches (Unveiling-CTAs, Tracegram);
+   - published results that did not reproduce (VELOX: ADP 0.14 here against 0.94).
 
    Each adopted repository is therefore reproduced on its own data, pinned, given regression tests, and written up in `docs/assessment/` before its numbers are trusted. Status is in §2.
 3. **One dataset end to end before adding more.** E3-CADETS first (about 10 GB, three attacks, node-level ground truth). Then THEIA and CLEARSCOPE, then the composite stream.
@@ -153,8 +154,8 @@ Status meanings:
 | `ncn-foreigners/BlockingPy` | Offline ANN backend comparison and its blocking metrics (`eval()`) | The live path (rebuilds the index on every call, no incremental insert) and its connected-component blocks | **Run** | Tests pass; its benchmark reproduces (recall 0.90–0.91 at 15k records, 0.82 at 150k). On 9,988 CTA sessions, 86% of nearest-neighbour links join the same actor, but its connected components are only 67% pure: one block holds 1,031 sessions from 7 actors. Shared tooling chains actors together. |
 | `janusza/ThreatTrace-Cyber-Attack-Detection` | The pooled `[count, mean, std, min, max]` vector as one feature family; mined-pair compaction as an ablated option; FedCSIS as a sanity check | The R implementation (regex compaction, `max` for `pmax`), fuzzy c-means, label-token GloVe | **Run** | Six patches to run (outputs that don't chain, a miner that doesn't finish). Basic-feature baseline reproduces (0.540). XGBoost gain is +0.011 here vs +0.049 published (0.915 vs 0.940). Plain activity counts score 0.927. Regex compaction changes 26.5% of traces; std features depend only on n; c-means adds nothing. |
 | `YuchenZhang-Academic/Tracegram` | The formulation (a trace as a bag of instances with attention weights as evidence), as a Phase 3 option | The payload-based flow encoder; the claim that the temporal aggregator adds value | **Run** | Test F1 1.000 on bundled IoT-Sentinel reproduces, but mean-pooling the same flow vectors with 1-NN also scores 1.000. Its own logs show 0.876 without payload and an unreported dataset at 0.395. |
-| `ubc-provenance/orthrus` | The DepImpact reconstruction algorithm, reimplemented with cross-window stitching; per-attack ground truth; evaluation rules | The GNN; the original config, which uses test data for word2vec and picks alerts by k-means over top test scores | **Read**, run through PIDSMaker | Reconstruction stays inside one 15-minute window. Not exactly reproducible (README: unset `PYTHONHASHSEED`). Non-snooped ADP on E3-CADETS is 0.94 (min 0.85), the same as VELOX (Bilot et al.). |
-| `ubc-provenance/PIDSMaker` | VELOX as the per-edge anomaly score; dataset dumps and converters; node-level ground truth; evaluation rules (5 seeds, ADP) | The other detectors | **Running** | E3-CADETS restored (36.5M events). Graphs build in 4 min on CPU. Training needed a memory patch to fit 15 GB: the loader held a second full copy of every edge, used only by ORTHRUS. Its `--tuned` config is missing. ADP pending. |
+| `ubc-provenance/orthrus` | The DepImpact reconstruction algorithm, reimplemented with cross-window stitching; per-attack ground truth; evaluation rules | The GNN; the original config, which uses test data for word2vec and picks alerts by k-means over top test scores | **Read** (its reconstruction has not been run yet; see `orthrus.md`) | Reconstruction stays inside one 15-minute window. Not exactly reproducible (README: unset `PYTHONHASHSEED`). Non-snooped ADP on E3-CADETS is 0.94 (min 0.85), the same as VELOX (Bilot et al.). |
+| `ubc-provenance/PIDSMaker` | Dataset dumps and converters; node-level ground truth; evaluation rules (5 seeds, ADP); VELOX only once it reproduces | The other detectors | **Run** | E3-CADETS restored (36.5M events). Graphs build in 4 min on CPU. VELOX did **not** reproduce: best ADP 0.143 against 0.94 published, across `main` default (0.008), `main` tuned (0.007) and the paper's `velox` branch with its tuned file (0.143). `main` lacks the tuned file, and its docs disagree with the branch. Training needed a memory patch to fit 15 GB. |
 | `bogertaNET/Unveiling-CTAs` | The corpus (94 actors, 9,988 beacon sessions, timestamps, ATT&CK tactics) and the SCLC normalizer | The hybrid and BERT models; the random-split scores | **Run** | Shipped models reproduce exactly (0.951 / 0.938 / 0.893). TF-IDF + logistic regression beats them on the authors' own split (0.962 / 0.948 / 0.926). Time-forward, accuracy falls to 0.65–0.80 (hybrid 0.747 vs TF-IDF 0.797 at 4 actors). |
 | `jev-sec/jev-ids` | Nothing | Everything | **Run** | Tests pass and its table recomputes from shipped predictions. The headline comparison is with a random forest trained on 5 examples; it classifies single NSL-KDD flows through a paid API and covers none of the six stages. |
 
@@ -188,7 +189,10 @@ Every linked repository has now been run here, on its own data, and the CTA corp
 4. **Prioritize and score candidate relationships (Progressive Entity Matching).**
    - **Unchanged:** sorted neighbourhood is primary, pyJedAI is pinned, and PESM is dropped because it does not reproduce.
 5. **Group and explain related activity (soft clustering, ORTHRUS).**
-   - **Anomaly score:** VELOX's per-edge loss. Published ADP on E3-CADETS is 0.94 (min 0.77, 5 seeds); the CPU reproduction is in progress (`pidsmaker-velox.md`).
+   - **Anomaly score:**
+     - **VELOX:** did not reproduce here; three CPU runs reached ADP 0.008, 0.007 and 0.143, against 0.94 published.
+     - **Before use:** it is re-tested on a GPU with 5 seeds from the paper's branch, against a simple edge-rarity score under the same ADP protocol. Whichever passes is used.
+     - **Not a gate:** the anomaly score only orders and seeds work. Reconstruction can also start from strong pair links and indicator hits, so stage 5 does not depend on any one detector.
    - **Reconstruction:**
      - **What it is:** ORTHRUS's DepImpact algorithm, reimplemented over our temporal graph: from each flagged node, build a versioned DAG, trace back to entry and forward to exit nodes, score them, and report the union.
      - **What we add:** windows are stitched together, because ORTHRUS reconstructs inside a single 15-minute window.
@@ -199,12 +203,12 @@ Every linked repository has now been run here, on its own data, and the CTA corp
    - **Evaluation:** attribution is evaluated time-forward only. Accuracy there is 0.65–0.80, so most command-only groups will end as *candidates* or *unresolved*, as designed.
    - **Unchanged:** the AURA-style retrieve-then-rank over ATT&CK.
 
-**The repeated lesson.** In four of the six stages, the simpler method matched or beat the published complex one on the authors' own data:
+**The repeated lesson.** In three stages measured here, and a fourth as published, the simpler method matched or beat the complex one:
 
 | Stage | Simpler method | Published complex method |
 |---|---|---|
 | 2 | mean-pooling | Tracegram's aggregator |
-| 5 | VELOX | ORTHRUS (Bilot et al.) |
+| 5 | VELOX | ORTHRUS (published by Bilot et al.; VELOX did not reproduce here, so this row is not counted) |
 | 4 | sorted neighbourhood | NN + BFS for deduplication |
 | 6 | TF-IDF | the CTA hybrid |
 
@@ -218,7 +222,7 @@ flowchart LR
     R[Readers] --> N[Normalize + hash, Arrow micro-batches]
     N --> W[(WAL segments, hash-chained)]
     N --> P[Drain parser, content-hashed templates]
-    P --> AN[VELOX anomaly score]
+    P --> AN[Anomaly score: VELOX or edge rarity]
     P --> TA[Trace assembler: open / sealed]
     AN --> TA
     TA --> F[Mergeable trace features]
@@ -310,7 +314,7 @@ Features, all mergeable:
 - **Indicators:** file hashes, domains, IPs, ports, JA3/JA4, user agents, named pipes and service names, as exact keys.
   - Postings are always written, each capped to its most recent 10k traces.
   - At query time, keys present in more than max(100, 0.1% of indexed traces) traces are skipped as too common.
-- **Anomaly:** maximum and mean VELOX loss over member events.
+- **Anomaly:** maximum and mean per-edge anomaly score over member events. The score is VELOX loss if it reproduces, otherwise edge rarity (§2.1).
 
 Phase 3 option: a MIL aggregator (instance MLP, time-gap encoding, gated attention pooling) trained with a supervised contrastive loss.
 - **Adoption rule:** it is adopted only if same-campaign recall@10 improves by at least 5 points over the pooled vector, at no more than 2× the CPU cost.
@@ -506,7 +510,10 @@ This table is the evidence that each research area earns its place.
 **Phase 0: Assess and test the premises (weeks 1–3)**
 - Finish the assessments, one note each in `docs/assessment/`:
   - **Done:** every linked repository has been run once (§2, §2.1).
-  - **Left for Phase 0:** VELOX ADP over 5 seeds on E3-CADETS, then DepImpact reconstruction on its detections.
+  - **Left for Phase 0:**
+    - **VELOX on a GPU:** VELOX did not reproduce on CPU (best ADP 0.143 against 0.94), so re-run it on a GPU with 5 seeds from the paper's `velox` branch.
+    - **Fallback score:** compare it with an edge-rarity score under the same ADP protocol.
+    - **Reconstruction:** run DepImpact on the score that passes.
   - **Next:** the CTA classifier under beacon-grouped and open-set splits; the time-forward split is already measured.
 - E3-CADETS converter to Event Parquet, plus ground-truth manifests and split files.
 - `third_party/` with pinned versions and fixes:
@@ -551,9 +558,12 @@ Deferred until the core loop works: an analyst UI beyond the static report, LLM 
 
 - **Actor labels are scarce.** Public data supports actor ranking only for command traces (CTA) and a single emulated actor (Carbanak). *Attributed* depends on the emulation lab, which measures documented behaviour, not real actors.
 - **Shared tooling.** Cobalt Strike and living-off-the-land binaries make cross-actor similarity common. Measure the false-link rate between actors that use the same framework.
-- **Seed instability.** Learned detectors vary widely across seeds (ORTHRUS ADP from 0.10 to 1.00 on E3-THEIA, Bilot et al.). Report variance; use seed averaging.
+- **Seed instability and non-reproduction.**
+  - **Across seeds:** learned detectors vary widely (ORTHRUS ADP from 0.10 to 1.00 on E3-THEIA, Bilot et al.).
+  - **Here:** VELOX reached ADP 0.143 at best, against 0.94 published.
+  - **Response:** report variance, average over seeds, and keep a simple non-learned score as the fallback.
 - **Sensor dependence.** Train per sensor family and test across sensors.
-- **Research code reliability.** Eight of the eleven repositories had at least one problem that would have changed results or blocked a run (decision 2). Only BlockingPy, Tracegram and jev-ids ran cleanly and reproduced as shipped. Even so, a pooled baseline ties Tracegram's aggregator. Every adopted component is therefore pinned, patched in `third_party/`, regression-tested against the original, and re-run when upgraded.
+- **Research code reliability.** Eight of the eleven repositories had at least one problem that would have changed results or blocked a run (decision 2). Only BlockingPy, Tracegram and jev-ids ran cleanly and reproduced as shipped. Even so, a pooled baseline ties Tracegram's aggregator. VELOX's published detection result did not reproduce. Every adopted component is therefore pinned, patched in `third_party/`, regression-tested against the original, and re-run when upgraded.
 - **LogCloud fit.** Boundary-crossing queries need the wrapper. Templates are per-batch. The newest data must be scanned directly. On local disk, plain scans may be as fast at workstation scale: the Phase 2 bake-off decides.
 - **Python throughput.** The 100k events/s target may need Rust ports of normalization and hashing. Decide after profiling, not before.
 - **Adversarial manipulation.** Out of scope for Phases 1–3 and recorded as a known gap.
