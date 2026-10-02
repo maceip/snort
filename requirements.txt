@@ -6,3 +6,4 @@ pytest>=7
 duckdb>=0.9
 pylance
 pandas
+mmh3

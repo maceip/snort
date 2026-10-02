@@ -12,36 +12,47 @@ import tempfile
 from pathlib import Path
 
 
+def get_sdk_roots() -> list[Path]:
+    candidates = [
+        os.environ.get("ANDROID_HOME"),
+        os.environ.get("ANDROID_SDK_ROOT"),
+        "/usr/local/lib/android/sdk",
+        "/opt/homebrew/share/android-commandlinetools",
+        str(Path.home() / "Library/Android/sdk"),
+        str(Path.home() / "Android/Sdk"),
+    ]
+    return [Path(c) for c in candidates if c and Path(c).exists()]
+
+
 def find_android_tool(name: str) -> str:
     # Check PATH first
     found = shutil.which(name)
     if found:
         return found
 
-    sdk_root = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT") or "/opt/homebrew/share/android-commandlinetools"
-    build_tools = Path(sdk_root) / "build-tools"
-    if build_tools.exists():
-        versions = sorted(build_tools.iterdir(), reverse=True)
-        for v in versions:
-            tool = v / name
-            if tool.exists() and os.access(tool, os.X_OK):
-                return str(tool)
+    for root in get_sdk_roots():
+        build_tools = root / "build-tools"
+        if build_tools.exists():
+            for v in sorted(build_tools.iterdir(), reverse=True):
+                tool = v / name
+                if tool.exists() and os.access(tool, os.X_OK):
+                    return str(tool)
 
-    cmdline_tools = Path(sdk_root) / "cmdline-tools" / "latest" / "bin" / name
-    if cmdline_tools.exists() and os.access(cmdline_tools, os.X_OK):
-        return str(cmdline_tools)
+        cmdline_tools = root / "cmdline-tools" / "latest" / "bin" / name
+        if cmdline_tools.exists() and os.access(cmdline_tools, os.X_OK):
+            return str(cmdline_tools)
 
     raise FileNotFoundError(f"Android tool {name} not found")
 
 
 def find_android_jar() -> str:
-    sdk_root = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT") or "/opt/homebrew/share/android-commandlinetools"
-    platforms = Path(sdk_root) / "platforms"
-    if platforms.exists():
-        for p in sorted(platforms.iterdir(), reverse=True):
-            jar = p / "android.jar"
-            if jar.exists():
-                return str(jar)
+    for root in get_sdk_roots():
+        platforms = root / "platforms"
+        if platforms.exists():
+            for p in sorted(platforms.iterdir(), reverse=True):
+                jar = p / "android.jar"
+                if jar.exists():
+                    return str(jar)
     raise FileNotFoundError("android.jar not found in Android SDK platforms")
 
 

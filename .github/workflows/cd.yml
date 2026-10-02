@@ -111,14 +111,9 @@ jobs:
           distribution: temurin
           java-version: "21"
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android build-tools
-        run: |
-          yes | sdkmanager "platforms;android-34" "build-tools;34.0.0"
-
       - name: Build Signed APK
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
         run: |
           python packaging/build_apk.py --output-dir dist --output-name snort-android-arm64.apk
 
