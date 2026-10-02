@@ -18,6 +18,65 @@ Status: proposal, third version. Every repository linked in `docs/sota/repos.md`
 
 Scope: one person, one workstation, one process, demonstrating all six stages from `docs/sota/origin/md` end to end on public data.
 
+## The bet, and why it should work
+
+**What we are building.** The opportunity in `origin/md` is retrieval-driven attribution:
+
+> incoming traces → behavioural representations → candidate retrieval → evidence-based scoring → overlapping groups → attribution updated as evidence arrives
+
+"Unresolved" is a first-class answer, and behavioural similarity is kept separate from identity. No published system does all six stages; each paper demonstrates one. This plan builds the whole loop once, on one workstation, on public data with ground truth, and measures it. That measurement is the gap `origin/md` names: end-to-end validation.
+
+**The bet.** Behavioural similarity between traces is strong enough to *find* related activity but not strong enough to *name* an actor on its own. The system therefore:
+1. retrieves generously;
+2. decides each link with calibrated evidence;
+3. never closes links transitively;
+4. attributes only when independent kinds of evidence agree.
+
+**Evidence that similarity finds related activity** (measured here):
+- **Attacker sessions:** on 9,988 real sessions from 94 actors, a session's nearest neighbour belongs to the same actor 86% of the time.
+- **LSH recall:** DynaHash reproduces at 0.96–0.99.
+- **Detection:** plain activity counts detect attack windows at AUC 0.93 on FedCSIS.
+- **Actor ranking:** TF-IDF ranks command sessions to the right actor 92–96% of the time on a random split.
+
+**Evidence that similarity is not identity** (also measured here):
+- **Chaining links:** chaining those same 86%-pure links into connected components drops purity to 67%, and one component merges 7 actors.
+- **Over time:** actor accuracy falls from 0.95 to 0.65–0.80 once training data comes only from the past.
+- **The best published LLM approach:** AURA reaches 83–87% top-1 on 30 reports.
+
+Any design that turns similarity directly into a label mislabels at a rate an analyst cannot accept: blocking components, hard clusters, or one classifier's argmax. That is the measured case for overlapping groups and "unresolved".
+
+**Why these components, and not the obvious alternatives:**
+
+| Stage | Choice | Rejected alternative | Measured reason |
+|---|---|---|---|
+| 1 Ingest | Parquet we write, indexed by rottnest's Rust LogCloud, with split-and-verify search | C++ LogCloud; grep alone | C++ missed 22 of 40 lookups at 961 MB; Rust found 40 of 40 in about 1.3 s. A Phase 2 bake-off against plain scans decides whether the index stays |
+| 2 Represent | Activity counts, pooled token vectors, MinHash, timing, all mergeable per event | ThreatTrace's pipeline; Tracegram's aggregator | Counts 0.927 vs ThreatTrace 0.915 on its own data; pooled 1-NN ties Tracegram (1.000). Both alternatives recompute in batch |
+| 3 Retrieve | DynaHash (fixed), HNSW and indicators, capped at 50 | BlockingPy's components | Links are 86% pure, components 67%. BlockingPy rebuilds its index on every call |
+| 4 Score | Sorted-neighbourhood scheduling, calibrated pair model | NN + BFS; PESM | PER's own deduplication results favour sorted neighbourhood; PESM does not reproduce |
+| 5 Group, explain | Overlapping memberships from calibrated links; VELOX score; DepImpact reconstruction across windows | Fuzzy c-means; ORTHRUS's GNN | Fuzzy memberships always sum to 1 and added nothing (0.920 without, 0.910 with). VELOX matches ORTHRUS (ADP 0.94) without test-data snooping |
+| 6 Attribute | TF-IDF + logistic regression and ATT&CK retrieval, fused against an explicit unknown actor | The CTA hybrid; LLM-decided attribution (AURA) | TF-IDF beats the hybrid on both splits. AURA has 30 test reports and no evidence weights, so an LLM may explain but not score |
+
+**What is new and unproven.** No paper answers these about the joined loop:
+1. Do traces built from streaming telemetry keep each attack in a few pure traces?
+2. Does trace-level similarity separate same-attack pairs from unrelated pairs on provenance data, not only on commands?
+3. Does the loop keep up at 10× replay on one machine?
+
+Phase 0's go/no-go tests answer 1 and 2 within three weeks; Phase 1 answers 3.
+
+**What would change the plan:**
+- **Trace boundaries fail (go/no-go 1):** redefine them (for example, session or beacon instead of process subtree) before building anything on them.
+- **No representation separates same-attack pairs** (AUC below 0.8, go/no-go 2): the system ships as evidence search plus provenance reconstruction (stages 1 and 5) without behavioural grouping, and the report says so.
+- **Attribution precision stays below 0.95 at useful coverage in the emulation lab:** attribution stays at *candidates*.
+
+**Why one workstation is enough.** Measured on 4 CPU cores:
+- E3-CADETS graphs build in 4 minutes;
+- VELOX trains in about 1.5 minutes per epoch;
+- DynaHash inserts about 1,000 sealed traces per second;
+- LogCloud indexes about 4 MB/s;
+- the CTA classifier trains in seconds.
+
+Nothing on the live path needs a GPU.
+
 ## 0. Definition of done
 
 One command, `snort demo`, on the reference workstation and from a clean checkout:
