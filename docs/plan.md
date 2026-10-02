@@ -84,13 +84,20 @@ flowchart LR
 
 | Stage | Input | Primary Implementation | Output | Fast Baseline |
 | :--- | :--- | :--- | :--- | :--- |
-| **1. Ingest & Store** | Raw JSON / CSV / CDM | [`snort.ingest.wal.WalWriter`](file:///Users/mac/snort/snort/ingest/wal.py), [`snort.store.seal`](file:///Users/mac/snort/snort/store/seal.py) | Sealed Lance + BLAKE3 data hashes | DuckDB + Lance extension (`LOAD lance;`) |
+| **1. Ingest & Store** | Raw JSON / CSV / CDM | [`snort.ingest.wal.WalWriter`](file:///Users/mac/snort/snort/ingest/wal.py), [`snort.store.seal`](file:///Users/mac/snort/snort/store/seal.py), [`snort.store.search`](file:///Users/mac/snort/snort/store/search.py) | Sealed Lance + BLAKE3 data hashes | Dynamic DuckDB Unified View (`UNION ALL` over Lance segments & WAL buffer) + Hybrid Lance BM25 scoring |
 | **2. Represent** | Normalized events | [`snort.trace.assembler`](file:///Users/mac/snort/snort/trace/assembler.py), [`snort.trace.features`](file:///Users/mac/snort/snort/trace/features.py) | Process subtrees / beacon sessions with MinHash (128) + TF-IDF | Token n-gram counts |
 | **3. Retrieve** | Trace features | [`snort.retrieve.minhash_lsh`](file:///Users/mac/snort/snort/retrieve/minhash_lsh.py), [`third_party.dynahash`](file:///Users/mac/snort/third_party/dynahash/dynahash.py) | Capped candidates ($\le 50$) | Exact indicator matches |
 | **4. Prioritize & Score** | Candidate pairs | [`snort.match.queue`](file:///Users/mac/snort/snort/match/queue.py), [`snort.match.pair_model`](file:///Users/mac/snort/snort/match/pair_model.py) | Calibrated link probabilities $P(\text{same-group})$ | Cosine threshold |
 | **5. Group & Explain** | Scored links | [`snort.grouping`](file:///Users/mac/snort/snort/grouping.py), DepImpact reconstruction | Overlapping groups + attack DAGs | Indicator components |
 | **6. Attribute** | Group commands + ATT&CK | [`snort.attrib.fusion`](file:///Users/mac/snort/snort/attrib/fusion.py) | Ranked candidates or `unresolved` | ATT&CK overlap |
 | **Lineage** | Any decision | [`snort.ledger.chain.Ledger`](file:///Users/mac/snort/snort/ledger/chain.py) | Cryptographic append-only chain | Plain JSONL log |
+
+> [!NOTE]
+> **Storage & Search Engine Lessons from `jevalin-web`:**
+> 1. **Dynamic DuckDB Unified View:** Evidence searches query all sealed `.lance` segments and the in-memory unsealed WAL buffer in a single vectorized `UNION ALL` query, pushing down predicates and limits across both live stream and cold datasets.
+> 2. **Hybrid BM25 Scoring:** Free-text searches leverage Lance's native full-text inverted index (`raw_idx`) to compute Tantivy BM25 relevance scores (`_score`) combined with exact boolean filter expressions (`filter_expr`).
+> 3. **Guard Against Constant Numeric Columns:** Lance serialization in [`lab/convert/event_schema.py`](file:///Users/mac/snort/lab/convert/event_schema.py) guards against synthetic constant numeric columns (which trigger DuckDB Lance reader RLE page decode bugs) by casting non-schema constant numerics to strings.
+
 
 ---
 
@@ -242,8 +249,9 @@ All stages adhere to the immutable record contracts in [`lab/convert/event_schem
 
 | Action | Command | Expected Result |
 | :--- | :--- | :--- |
-| **Run Core Tests** | `.venv/bin/pytest` | `64 passed` |
+| **Run Core Tests** | `.venv/bin/pytest` | `67 passed` |
 | **Run DynaHash Tests** | `.venv/bin/python -m unittest discover -s third_party/dynahash/tests -t third_party/dynahash` | `23 passed` |
 | **Run End-to-End Demo** | `.venv/bin/python -m snort.cli demo --out bench/results/demo` | `verify: OK`, writes `metrics.md` |
 | **Verify Ledger** | `.venv/bin/python -m snort.cli verify-ledger bench/results/demo/ledger.jsonl` | `OK` |
-| **Search Evidence** | `.venv/bin/python -m snort.cli search "query" --sealed-dir sealed/` | Matching row-groups printed |
+| **Unified Search** | `.venv/bin/python -m snort.cli search "query" --sealed-dir sealed/ --wal-dir wal/` | Fast SIMD scan across sealed + WAL |
+| **Hybrid BM25 Search** | `.venv/bin/python -m snort.cli search "query" --sealed-dir sealed/ --bm25 --filter "host = 'h1'"` | BM25 scored & ranked matches |

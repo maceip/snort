@@ -53,12 +53,21 @@ def _cmd_index(args: argparse.Namespace) -> int:
 def _cmd_search(args: argparse.Namespace) -> int:
     from snort.store.search import search
 
-    matches = search(args.query, args.sealed_dir, args.index_dir, args.wal_dir, limit=args.limit)
+    matches = search(
+        args.query,
+        args.sealed_dir,
+        args.index_dir,
+        args.wal_dir,
+        limit=args.limit,
+        bm25=getattr(args, "bm25", False),
+        filter_expr=getattr(args, "filter", None),
+    )
     if args.json:
         print(json.dumps(matches, indent=2))
     else:
         for match in matches:
-            print(f"{match['_segment']}:{match['_row']} [{match['_source']}] {match['raw'][:200]}")
+            score_str = f" (score={match['_score']:.3f})" if "_score" in match else ""
+            print(f"{match['_segment']}:{match.get('_row', 0)} [{match['_source']}]{score_str} {match['raw'][:200]}")
         print(f"{len(matches)} match(es)", file=sys.stderr)
     return 0
 
@@ -318,6 +327,8 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--index-dir", default="index")
     search.add_argument("--wal-dir", default="wal")
     search.add_argument("--limit", type=int, default=1000)
+    search.add_argument("--bm25", action="store_true", help="rank results with Lance BM25 full-text scoring")
+    search.add_argument("--filter", default=None, help="additional boolean filter expression (e.g. host = 'h1')")
     search.add_argument("--json", action="store_true")
     search.set_defaults(func=_cmd_search)
 

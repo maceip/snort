@@ -194,3 +194,74 @@ def test_cli_demo_end_to_end():
     assert report["verify"] is True
     assert report["searches"]["10.10.34.20:72349"] == 1
     assert report["searches"]["powershell"] == 1
+
+
+def test_unified_duckdb_view_with_wal(tmp_path):
+    wal_dir, sealed_dir, index_dir = _build_store(tmp_path, index_first_only=True)
+    # Add an event to the unsealed WAL tail
+    with WalWriter(wal_dir, max_bytes=10**9) as wal:
+        wal.append(normalize_event(_raw(*RAWS[2])))
+
+    # Search for a term that appears in both sealed and unsealed WAL
+    matches = search("powershell", sealed_dir, index_dir, wal_dir)
+    assert len(matches) == 2
+    sources = {m["_source"] for m in matches}
+    assert "wal" in sources
+    # Both matches have valid _segment and _row
+    for m in matches:
+        assert m["_segment"]
+        assert isinstance(m["_row"], int)
+
+
+def test_hybrid_bm25_scoring(tmp_path):
+    from snort.store.search import search_bm25
+
+    wal_dir, sealed_dir, index_dir = _build_store(tmp_path, index_first_only=False)
+    # Query with BM25 full-text scoring
+    bm25_hits = search_bm25("powershell", sealed_dir, index_dir, wal_dir)
+    assert len(bm25_hits) >= 1
+    assert "_score" in bm25_hits[0]
+    assert bm25_hits[0]["_score"] > 0.0
+
+    # Query with BM25 + exact boolean filter
+    filtered_hits = search_bm25(
+        "powershell",
+        sealed_dir,
+        index_dir,
+        wal_dir,
+        filter_expr="host = 'ws-2'",
+    )
+    assert len(filtered_hits) >= 1
+    assert all(h["host"] == "ws-2" for h in filtered_hits)
+
+
+def test_guard_constant_numeric_columns(tmp_path):
+    import duckdb
+    import pandas as pd
+    from lab.convert import event_schema as es
+
+    df = pd.DataFrame([{
+        "ts": 1000,
+        "host": "h1",
+        "source_id": "test",
+        "source_seq": 0,
+        "ingest_ts": 1000,
+        "subject": "s1",
+        "object": "o1",
+        "action": "exec",
+        "template_hash": "th",
+        "event_hash": "eh",
+        "raw": "powershell test",
+        "synthetic_rev": 1,  # Constant numeric column that would crash DuckDB RLE page reader
+        "cluster_id": 42,    # Another constant numeric column
+    }])
+
+    lance_path = tmp_path / "guarded.lance"
+    es.to_lance(df, str(lance_path))
+
+    con = duckdb.connect()
+    con.execute("LOAD lance;")
+    res = con.execute(f"SELECT * FROM '{lance_path.as_posix()}'").fetchdf()
+    assert len(res) == 1
+    assert res["synthetic_rev"].iloc[0] == "1"
+    assert res["cluster_id"].iloc[0] == "42"

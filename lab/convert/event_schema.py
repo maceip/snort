@@ -68,12 +68,25 @@ def to_parquet(df, path: str) -> None:
 
 
 def to_lance(df, path: str) -> None:
+    import pandas as pd
     import pyarrow as pa
     import lance
 
-    for col, dtype in (EVENT_COLUMNS if "event_hash" in df.columns else TRACE_COLUMNS).items():
+    cols_spec = EVENT_COLUMNS if "event_hash" in df.columns else TRACE_COLUMNS
+    for col, dtype in cols_spec.items():
         if col not in df.columns:
             raise ValueError(f"missing required column: {col}")
+
+    # Guard against constant numeric columns (Lesson from jevalin-web):
+    # DuckDB's native Lance scanner aborts on all-constant numeric columns
+    # (empty RLE page out-of-bounds bug). Ensure any non-schema synthetic
+    # or constant numeric column is cast to string.
+    df = df.copy()
+    for col in df.columns:
+        if col not in cols_spec and pd.api.types.is_numeric_dtype(df[col]):
+            if df[col].nunique(dropna=False) <= 1:
+                df[col] = df[col].astype(str)
+
     table = pa.Table.from_pandas(df, preserve_index=False)
     lance.write_dataset(table, path, mode="overwrite")
 
