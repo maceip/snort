@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.venv/
+env/
+venv/
+ENV/
+
+# Build and distribution
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Testing and caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local artifacts and databases
+bench/results/
+*.dump
+wal/
+sealed/
+index/
+data/

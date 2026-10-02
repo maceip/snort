@@ -1,0 +1,23 @@
+# Pinned third-party dependencies for snort (docs/plan.md sect. 10, weeks 1-2).
+# Provenance and reproduction notes: docs/assessment/dynahash-per.md (DynaHash,
+# PER/pyJedAI) and docs/assessment/logcloud.md (LogCloud/rottnest).
+
+# --- DynaHash runtime (vendored implementation in third_party/dynahash) ---
+# Pinned to the versions in upstream's requirements at dimkar121/DynaHash@14fbaa9.
+mmh3==4.1.0
+numpy==1.26.3
+
+# --- Rust LogCloud index over Parquet segments we write ourselves ---
+# Verified on 961 MB: 40/40 exact lookups, ~1.3 s/query, ~4 MB/s indexing.
+# NOTE: rottnest 1.5.0 publishes a manylinux x86_64 wheel only, so install
+# this pin on the reference Linux workstation, not on macOS.
+rottnest==1.5.0
+# Transitive pin: rottnest 1.5.0 search breaks with current getdaft
+# (daft.table was removed); verified working with getdaft==0.3.15.
+getdaft==0.3.15
+
+# --- Optional: DynaHash persistent (RocksDB) mode only ---
+# Upstream imports this binding as `rocksdbpy` but never declares it (and its
+# requirements.txt is UTF-16 without the entry). PyPI name is rocksdb-py;
+# sdist-only, needs a C++ toolchain to build. Not needed for in-memory use.
+# rocksdb-py==0.0.5

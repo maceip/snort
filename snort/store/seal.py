@@ -1,0 +1,134 @@
+"""Seal WAL segments to zstd Parquet (plan section 4.1).
+
+Each hour (or 256 MB) the WAL is written to Parquet files we control.
+Columns are the Event schema (``EVENT_COLUMNS``); files use zstd
+compression with 100k-row row groups so the search wrapper can read
+only the row groups that hold index hits. A ``sealed-manifest.json``
+chains every sealed segment to the previous one, extending the
+tamper-evident lineage from the WAL.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from snort.ingest.events import EVENT_COLUMNS
+from snort.ingest.wal import MANIFEST_NAME, _read_lines
+
+SEALED_MANIFEST = "sealed-manifest.json"
+ROW_GROUP_SIZE = 100_000
+
+
+def _sealed_name(seq: int) -> str:
+    return f"seg-{seq:06d}.parquet"
+
+
+def _parquet_hash(path: Path) -> str:
+    digest = hashlib.blake3(path.read_bytes()) if hasattr(hashlib, "blake3") else hashlib.sha256(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _load_manifest(sealed_dir: Path) -> list[dict]:
+    manifest = sealed_dir / SEALED_MANIFEST
+    if not manifest.exists():
+        return []
+    return json.loads(manifest.read_text(encoding="utf-8"))["segments"]
+
+
+def seal_segments(wal_dir: str | Path, sealed_dir: str | Path, *, row_group_size: int = ROW_GROUP_SIZE) -> list[dict]:
+    """Seal every unsealed WAL segment to Parquet. Idempotent.
+
+    Returns the manifest entries for newly sealed segments.
+    """
+    wal_dir = Path(wal_dir)
+    sealed_dir = Path(sealed_dir)
+    sealed_dir.mkdir(parents=True, exist_ok=True)
+    wal_manifest_path = wal_dir / MANIFEST_NAME
+    if not wal_manifest_path.exists():
+        return []
+    wal_entries = json.loads(wal_manifest_path.read_text(encoding="utf-8"))["segments"]
+    sealed = _load_manifest(sealed_dir)
+    done = {entry["wal_segment"] for entry in sealed}
+    prev_root = sealed[-1]["root"] if sealed else "GENESIS"
+    sealed_seq = max((entry["seq"] for entry in sealed), default=0)
+    new_entries: list[dict] = []
+    for wal_entry in wal_entries:
+        if wal_entry["name"] in done:
+            continue
+        wal_path = wal_dir / wal_entry["name"]
+        if not wal_path.exists():
+            continue
+        events = []
+        for line in _read_lines(wal_path):
+            line = line.strip()
+            if line:
+                events.append(json.loads(line)["event"])
+        columns: dict[str, list] = {name: [] for name in EVENT_COLUMNS}
+        for event in events:
+            for name in EVENT_COLUMNS:
+                value = event.get(name, "")
+                columns[name].append(value if name != "source_seq" else int(value))
+        table = pa.table({name: pa.array(columns[name]) for name in EVENT_COLUMNS})
+        sealed_seq += 1
+        out_path = sealed_dir / _sealed_name(sealed_seq)
+        pq.write_table(table, out_path, compression="zstd", row_group_size=row_group_size)
+        root = _parquet_hash(out_path)
+        entry = {
+            "seq": sealed_seq,
+            "name": out_path.name,
+            "wal_segment": wal_entry["name"],
+            "wal_root": wal_entry["root"],
+            "count": len(events),
+            "prev_root": prev_root,
+            "root": root,
+        }
+        sealed.append(entry)
+        new_entries.append(entry)
+        prev_root = root
+    if new_entries:
+        tmp = sealed_dir / (SEALED_MANIFEST + ".tmp")
+        tmp.write_text(json.dumps({"segments": sealed}, indent=2), encoding="utf-8")
+        os.replace(tmp, sealed_dir / SEALED_MANIFEST)
+    return new_entries
+
+
+def verify_sealed_chain(wal_dir: str | Path, sealed_dir: str | Path) -> dict:
+    """Verify sealed segments against the WAL roots and the chain."""
+    sealed_dir = Path(sealed_dir)
+    errors: list[str] = []
+    entries = _load_manifest(sealed_dir)
+    wal_roots = {}
+    wal_manifest_path = Path(wal_dir) / MANIFEST_NAME
+    if wal_manifest_path.exists():
+        for entry in json.loads(wal_manifest_path.read_text(encoding="utf-8"))["segments"]:
+            wal_roots[entry["name"]] = entry["root"]
+    prev_root = "GENESIS"
+    events = 0
+    for entry in entries:
+        if entry["prev_root"] != prev_root:
+            errors.append(f"{entry['name']}: sealed chain link broken")
+        path = sealed_dir / entry["name"]
+        if not path.exists():
+            errors.append(f"{entry['name']}: missing parquet file")
+            continue
+        if _parquet_hash(path) != entry["root"]:
+            errors.append(f"{entry['name']}: parquet hash mismatch")
+        wal_root = wal_roots.get(entry["wal_segment"])
+        if wal_root is not None and wal_root != entry["wal_root"]:
+            errors.append(f"{entry['name']}: WAL root mismatch")
+        try:
+            got = pq.read_metadata(path).num_rows
+        except Exception as exc:
+            errors.append(f"{entry['name']}: unreadable parquet: {exc}")
+            continue
+        if got != entry["count"]:
+            errors.append(f"{entry['name']}: count mismatch (manifest {entry['count']}, parquet {got})")
+        events += entry["count"]
+        prev_root = entry["root"]
+    return {"ok": not errors, "segments_checked": len(entries), "events": events, "errors": errors}
