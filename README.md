@@ -1,2 +1,3 @@
 # snort
-single-process live event ingestion with real-time grouping and tamper-proof trace lineage
+
+Single-process live event ingestion with real-time grouping, Lance + DuckDB hybrid search, and tamper-proof trace lineage.

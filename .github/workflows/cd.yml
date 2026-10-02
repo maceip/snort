@@ -2,6 +2,7 @@ name: CD
 
 on:
   push:
+    branches: [main]
     tags:
       - "v*"
   workflow_dispatch:
@@ -69,7 +70,7 @@ jobs:
           path: dist/${{ matrix.target }}
           if-no-files-found: error
 
-  build-android:
+  build-android-executable:
     name: Build Binary (snort-android-arm64)
     runs-on: ubuntu-latest
     steps:
@@ -85,16 +86,47 @@ jobs:
         run: |
           python packaging/build_android.py --output-dir dist
 
-      - name: Upload Android Artifact
+      - name: Upload Android Executable Artifact
         uses: actions/upload-artifact@v4
         with:
           name: snort-android-arm64
           path: dist/snort-android-arm64
           if-no-files-found: error
 
+  build-apk:
+    name: Build Android APK (snort-android-arm64.apk)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android build-tools
+        run: |
+          sdkmanager "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Build Signed APK
+        run: |
+          python packaging/build_apk.py --output-dir dist --output-name snort-android-arm64.apk
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: snort-android-arm64.apk
+          path: dist/snort-android-arm64.apk
+          if-no-files-found: error
+
   publish-release:
     name: Publish GitHub Release Artifacts
-    needs: [build-binaries, build-android]
+    needs: [build-binaries, build-android-executable, build-apk]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -126,7 +158,7 @@ jobs:
           elif [ -n "${{ inputs.tag_name }}" ]; then
             echo "tag=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
           else
-            echo "tag=v0.1.0" >> $GITHUB_OUTPUT
+            echo "tag=v0.1.0-build-${{ github.run_number }}" >> $GITHUB_OUTPUT
           fi
 
       - name: Create GitHub Release and Upload Artifacts
