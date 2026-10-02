@@ -12,7 +12,60 @@ single-process telemetry store and trace grouping engine with lance, duckdb, and
 - tamper verification: verify that stored files and decision ledgers have not been altered.
 - cross-platform: prebuilt binaries for linux, macos, windows, and android.
 
+## Query Architecture
+
+```mermaid
+---
+config:
+  theme: base
+  flowchart:
+    curve: basis
+    nodeSpacing: 30
+    rankSpacing: 38
+  themeVariables:
+    primaryColor: "#161B22"
+    primaryTextColor: "#E6EDF3"
+    primaryBorderColor: "#6E7681"
+    lineColor: "#8B949E"
+    secondaryColor: "#21262D"
+    tertiaryColor: "#0D1117"
+---
+flowchart TB
+
+    SRC["Telemetry / Dataset Sources"]
+    Q["Incoming Queries"]
+
+    SRC --> READ["Readers"]
+    READ --> WAL["BLAKE3 WAL"]
+    WAL --> BUF["In-Memory Buffer"]
+
+    Q --> TEXT["Free-text / Keywords"]
+    Q --> SQL["Structured / Analytics"]
+
+    TEXT --> SDK["Lance Native SDK"]
+    SQL --> DUCK["DuckDB"]
+
+    BUF -->|"seal / append"| LANCE["Lance Dataset"]
+
+    SDK --> LANCE
+    DUCK --> BUF
+    DUCK --> LANCE
+
+    LANCE --> INDEX["Native Indexes
+    BTREE · Full-Text · Vector"]
+
+    classDef source fill:#21262D,stroke:#6E7681,color:#E6EDF3,stroke-width:1px
+    classDef engine fill:#161B22,stroke:#8B949E,color:#E6EDF3,stroke-width:1.5px
+    classDef storage fill:#0D1117,stroke:#C9D1D9,color:#FFFFFF,stroke-width:2px
+    classDef index fill:#161B22,stroke:#6E7681,color:#C9D1D9,stroke-width:1px
+
+    class SRC,Q source
+    class SDK,DUCK engine
+    class LANCE storage
+    class INDEX index
+```
 ## install
+
 
 download prebuilt binaries from github releases or install locally:
 
