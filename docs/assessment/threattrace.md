@@ -37,7 +37,7 @@ Environment: 4-core cloud container, 15 GB RAM, R 4.6.1 (CRAN), data.table 1.18.
 | ID | Problem | Patch |
 |---|---|---|
 | P1 | Notebook 1 lists raw audit-log folders and attack lists that are not shipped | Removed; they feed only exploratory statistics |
-| P2 | (Not required.) The training table was read from the shipped CSV (`data/model_training_data_v2.7z`). The RData copy has the same 18,838,658 rows | P2_CHECK |
+| P2 | (Not required.) The training table was read from the shipped CSV (`data/model_training_data_v2.7z`). The RData copy has the same 18,838,658 rows | Read from CSV; the contents have not yet been compared with the RData copy |
 | — | `bupaverse` is not on CRAN; current `Matrix`/`arules` need R ≥ 4.4 | R 4.6 from CRAN; `bupaR` with its process-map packages instead; plotting chunks skipped |
 | P4 | Notebook 2 loads `IoT_case_traces_compacted_v1.RData` and `..._glove_..._v2.RData`, which no shipped notebook writes (notebook 1 writes `..._supervised_embedds.RData` and `..._v3.RData`) | Mapped to notebook 1's outputs |
 | P4b | Notebook 1's training traces keep the label as first and last token (`START,FALSE,…,FALSE`); notebook 1 strips them in its own embedding chunk, notebook 2 does not | Stripped the same way, so training and test traces share a format |

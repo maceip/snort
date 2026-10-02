@@ -51,12 +51,19 @@ Everything in this plan exists to make that command produce honest numbers.
    - whether behavioural similarity separates traces from the same attack from unrelated ones.
 
    If either fails, the representation is redesigned before anything downstream is built.
-5. **Simplest working version first, at every stage.** Each stage ships with a baseline number. A more complex method replaces it only if it wins on the benchmark by a stated margin, the main lesson of *Sometimes Simpler is Better*.
+5. **Simplest working version first, at every stage.** Each stage ships with a baseline number. A more complex method replaces it only if it wins on the benchmark by a stated margin. This is the main lesson of *Sometimes Simpler is Better*, and the runs here repeated it in four stages (§2.1).
 6. **Template IDs are content hashes.**
    - **Live features:** an online Drain parser supplies the tokens.
    - **Storage and search:** LogCrisp, via LogCloud, runs when a segment is sealed.
    - **Why hashing:** LogCrisp retrains its templates for every batch, so its IDs are not stable. Every template is identified by a hash of its normalized text, which makes both vocabularies stable and lets them be joined.
-7. **Trace representations are mergeable summaries.** They combine ThreatTrace-style pooled embedding statistics, a MinHash sketch, a technique set and a timing histogram, so open traces update in O(1) per event.
+7. **Trace representations are mergeable summaries.** They combine:
+   - activity counts (the measured stage-2 baseline);
+   - ThreatTrace-style pooled embedding statistics;
+   - a MinHash sketch;
+   - a technique set;
+   - a timing histogram.
+
+   All of these update in O(1) per event while a trace is open.
 8. **Candidates come from three indexes, unioned and capped:**
    - DynaHash LSH, using the authors' code with its defects fixed;
    - one HNSW index per modality;
@@ -87,8 +94,8 @@ Status meanings:
 | `ncn-foreigners/BlockingPy` | Offline ANN backend comparison and its blocking metrics (`eval()`) | The live path (rebuilds the index on every call, no incremental insert) and its connected-component blocks | **Run** | Tests pass; its benchmark reproduces (recall 0.90–0.91 at 15k records, 0.82 at 150k). On 9,988 CTA sessions, 86% of nearest-neighbour links join the same actor, but its connected components are only 67% pure: one block holds 1,031 sessions from 7 actors. Shared tooling chains actors together. |
 | `janusza/ThreatTrace-Cyber-Attack-Detection` | The pooled `[count, mean, std, min, max]` vector as one feature family; mined-pair compaction as an ablated option; FedCSIS as a sanity check | The R implementation (regex compaction, `max` for `pmax`), fuzzy c-means, label-token GloVe | **Run** | Six patches to run (outputs that don't chain, a miner that doesn't finish). Basic-feature baseline reproduces (0.540). XGBoost gain is +0.011 here vs +0.049 published (0.915 vs 0.940). Plain activity counts score 0.927. Regex compaction changes 26.5% of traces; std features depend only on n; c-means adds nothing. |
 | `YuchenZhang-Academic/Tracegram` | The formulation (a trace as a bag of instances with attention weights as evidence), as a Phase 3 option | The payload-based flow encoder; the claim that the temporal aggregator adds value | **Run** | Test F1 1.000 on bundled IoT-Sentinel reproduces, but mean-pooling the same flow vectors with 1-NN also scores 1.000. Its own logs show 0.876 without payload and an unreported dataset at 0.395. |
-ORTHRUS_ROW
-VELOX_ROW
+| `ubc-provenance/orthrus` | The DepImpact reconstruction algorithm, reimplemented with cross-window stitching; per-attack ground truth; evaluation rules | The GNN; the original config, which uses test data for word2vec and picks alerts by k-means over top test scores | **Read**, run through PIDSMaker | Reconstruction stays inside one 15-minute window. Not exactly reproducible (README: unset `PYTHONHASHSEED`). Non-snooped ADP on E3-CADETS is 0.94 (min 0.85), the same as VELOX (Bilot et al.). |
+| `ubc-provenance/PIDSMaker` | VELOX as the per-edge anomaly score; dataset dumps and converters; node-level ground truth; evaluation rules (5 seeds, ADP) | The other detectors | **Running** | E3-CADETS restored (36.5M events). Graphs build in 4 min on CPU. Training needed a memory patch to fit 15 GB: the loader held a second full copy of every edge, used only by ORTHRUS. Its `--tuned` config is missing. ADP pending. |
 | `bogertaNET/Unveiling-CTAs` | The corpus (94 actors, 9,988 beacon sessions, timestamps, ATT&CK tactics) and the SCLC normalizer | The hybrid and BERT models; the random-split scores | **Run** | Shipped models reproduce exactly (0.951 / 0.938 / 0.893). TF-IDF + logistic regression beats them on the authors' own split (0.962 / 0.948 / 0.926). Time-forward, accuracy falls to 0.65–0.80 (hybrid 0.747 vs TF-IDF 0.797 at 4 actors). |
 | `jev-sec/jev-ids` | Nothing | Everything | **Run** | Tests pass and its table recomputes from shipped predictions. The headline comparison is with a random forest trained on 5 examples; it classifies single NSL-KDD flows through a paid API and covers none of the six stages. |
 
@@ -122,7 +129,7 @@ Every linked repository has now been run here, on its own data, and the CTA corp
 4. **Prioritize and score candidate relationships (Progressive Entity Matching).**
    - **Unchanged:** sorted neighbourhood is primary, pyJedAI is pinned, and PESM is dropped because it does not reproduce.
 5. **Group and explain related activity (soft clustering, ORTHRUS).**
-   - **Anomaly score:** VELOX's per-edge loss. VELOX_RESULT
+   - **Anomaly score:** VELOX's per-edge loss. Published ADP on E3-CADETS is 0.94 (min 0.77, 5 seeds); the CPU reproduction is in progress (`pidsmaker-velox.md`).
    - **Reconstruction:**
      - **What it is:** ORTHRUS's DepImpact algorithm, reimplemented over our temporal graph: from each flagged node, build a versioned DAG, trace back to entry and forward to exit nodes, score them, and report the union.
      - **What we add:** windows are stitched together, because ORTHRUS reconstructs inside a single 15-minute window.
@@ -138,7 +145,7 @@ Every linked repository has now been run here, on its own data, and the CTA corp
 | Stage | Simpler method | Published complex method |
 |---|---|---|
 | 2 | mean-pooling | Tracegram's aggregator |
-| 5 | VELOX | ORTHRUS (Bilot et al.; VELOX_CONFIRM) |
+| 5 | VELOX | ORTHRUS (Bilot et al.) |
 | 4 | sorted neighbourhood | NN + BFS for deduplication |
 | 6 | TF-IDF | the CTA hybrid |
 
@@ -234,6 +241,7 @@ Features, all mergeable:
 - **Token stream:** template hashes, SCLC-normalized commands, or (action, object class) tokens.
   - **Compaction:** run-length collapse and mined-pair substitution (ThreatTrace's rules), implemented on token arrays rather than ThreatTrace's string regexes, which corrupt 26.5% of traces.
   - **Gated:** compaction is applied at seal only if the stage-2 ablation shows it beats uncompacted tokens.
+- **Counts:** log counts of tokens and token bigrams. This is the stage-2 baseline: on ThreatTrace's own data it scored above ThreatTrace's representation.
 - **Shingle set:** 1–3-grams of tokens plus ATT&CK technique IDs, sketched with 128 MinHash functions.
 - **Pooled vector:** `[log n, mean, std, min, max]` of 64-d subword token vectors (fastText-style, over template text). The std is per dimension per trace; ThreatTrace's version collapses it to a function of n.
   - The vectors are trained per modality and shipped with the parser vocabulary as one versioned artifact.
@@ -439,7 +447,7 @@ This table is the evidence that each research area earns its place.
 **Phase 0: Assess and test the premises (weeks 1–3)**
 - Finish the assessments, one note each in `docs/assessment/`:
   - **Done:** every linked repository has been run once (§2, §2.1).
-  - **Left for Phase 0:** VELOX_PHASE0
+  - **Left for Phase 0:** VELOX ADP over 5 seeds on E3-CADETS, then DepImpact reconstruction on its detections.
   - **Next:** the CTA classifier under beacon-grouped and open-set splits; the time-forward split is already measured.
 - E3-CADETS converter to Event Parquet, plus ground-truth manifests and split files.
 - `third_party/` with pinned versions and fixes:

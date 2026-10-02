@@ -27,15 +27,15 @@ Environment: 4-core cloud container, 15 GB RAM, CPU only, Python 3.10 venv (torc
 
 ## Runs
 
-RUNS
+In progress. Measured so far: graph construction 4 min, word2vec 20 s, feature inference 3.5 min, and training about 1.5 min per epoch on 4 CPU cores. Peak memory is about 14 GB after the patch below.
 
 ## Findings
 
-FINDINGS
+1. **The pipeline did not fit in 15 GB.** The training loader keeps train, val and test edge features in memory and then concatenates them into a second full copy (`get_full_data`). Only the TGN last-neighbour loader uses that copy, and VELOX does not use that loader. The first run was killed at 13.6 GB. A two-line patch skips the copy when that loader is off; it does not change results.
 
 ## Verdict
 
-VERDICT
+Pending the ADP result.
 
 ## Reproduce
 

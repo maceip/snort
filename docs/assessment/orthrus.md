@@ -53,11 +53,10 @@ Environment: 4-core cloud container, 15 GB RAM, CPU only. `ubc-provenance/orthru
    4. It keeps the top-scoring entry and exit, and reports the union of their dependency nodes.
    - **No stitching across windows:** an attack that spans windows becomes one subgraph per window.
    - **Cost per flagged node:** each one rebuilds its window's DAG and scans every DAG node to find entries.
-5. RUN_FINDING
 
 ## Runs
 
-RUNS
+In progress: VELOX with PIDSMaker's DepImpact triage on E3-CADETS (see `pidsmaker-velox.md`).
 
 ## Verdict
 
