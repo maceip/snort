@@ -1,10 +1,20 @@
 # snort: end-to-end build plan
 
-Status: proposal, second version. It was rewritten after running three of the linked codebases on their own data:
-- DynaHash and PER: `docs/assessment/dynahash-per.md`
-- LogCloud: `docs/assessment/logcloud.md`
+Status: proposal, third version. Every repository linked in `docs/sota/repos.md` has been run on its own data, with one note each in `docs/assessment/`:
 
-The other repositories have been read but not yet run; Phase 0 runs them. Numbers marked "target" are starting points, to be replaced by measured baselines.
+| Note | Repositories |
+|---|---|
+| `logcloud.md` | logcloud, rottnest |
+| `threattrace.md` | ThreatTrace |
+| `tracegram.md` | Tracegram |
+| `dynahash-per.md` | DynaHash, PER |
+| `blockingpy.md` | BlockingPy |
+| `pidsmaker-velox.md` | PIDSMaker and VELOX |
+| `orthrus.md` | ORTHRUS |
+| `unveiling-ctas.md` | Unveiling-CTAs |
+| `jev-ids.md` | jev-ids |
+
+§2.1 summarises what the runs changed, stage by stage. Numbers marked "target" are starting points, to be replaced by measured baselines.
 
 Scope: one person, one workstation, one process, demonstrating all six stages from `docs/sota/origin/md` end to end on public data.
 
@@ -25,12 +35,14 @@ Everything in this plan exists to make that command produce honest numbers.
    - **The one exception:** segment indexing runs in a helper process, because LogCrisp writes into its working directory, is not reentrant, and can crash on bad input.
    - **Porting:** a component moves to Rust only once profiling shows it is the bottleneck. The port is validated against the Python version on the same seeds.
    - **Why:** most of the linked code is Python or has Python bindings; the plan is sized for one person; and end-to-end evidence matters more than raw speed early on.
-2. **Run every repository before relying on it.** Running DynaHash, PER and LogCloud found five classes of problem:
-   - wrong formulas;
-   - silent record loss;
-   - missed search results;
-   - crashes;
-   - dependencies that no longer install or that change results.
+2. **Run every repository before relying on it.** Running all eleven found these classes of problem:
+   - wrong formulas (DynaHash's table count, ThreatTrace's std);
+   - silent record loss or corruption (DynaHash keys, ThreatTrace's compaction);
+   - missed search results and crashes (LogCloud);
+   - dependencies that no longer install or that change results (rottnest, pyJedAI, PIDSMaker's dump format);
+   - pipelines that do not run as shipped (ThreatTrace needed six patches);
+   - evaluations that use test data or random splits (ORTHRUS, Unveiling-CTAs);
+   - complex models that a simple baseline matches (Unveiling-CTAs, Tracegram, ORTHRUS against VELOX).
 
    Each adopted repository is therefore reproduced on its own data, pinned, given regression tests, and written up in `docs/assessment/` before its numbers are trusted. Status is in §2.
 3. **One dataset end to end before adding more.** E3-CADETS first (about 10 GB, three attacks, node-level ground truth). Then THEIA and CLEARSCOPE, then the composite stream.
@@ -72,13 +84,13 @@ Status meanings:
 | `marsupialtail/rottnest` (Rust LogCloud, `rottnest==1.5.0`) | The LogCloud index and search over Parquet segments we write ourselves, pinned with `getdaft==0.3.15` | — | **Run** | Same 961 MB: 40 of 40 exact lookups, about 1.3 s per query, about 4 MB/s indexing on 4 cores. Index is 229 MB on top of 105 MB Parquet (random IDs, close to the worst case). Shares the boundary-query problem; splitting the query and filtering for the full string fixed it in testing. Search breaks with current `getdaft`. |
 | `dimkar121/DynaHash` | The code: MinHash, Hamming LSH, RocksDB store, multi-probe, ranked retrieval | — | **Run** | Recall reproduces (0.99, 0.96). About 1,000 inserts/s. Five defects to fix: hash-table count wrong for θ ≠ 0.5; same-key records collapse; T exists only in a demo script and keeps all vectors in RAM; multi-probe trees are static; input fixed to character 2-grams. Its RocksDB binding is missing from `requirements.txt`. |
 | `JacobMaciejewski/PER-Design-Space-Exploration` | Runner and configs over pinned pyJedAI as the scheduling benchmark; sorted neighbourhood as the primary method | NN + BFS as the default | **Run** | Join reproduces exactly and sorted neighbourhood closely; PESM does not (unpinned pyJedAI). NN embedding took about 6 s per record on CPU. Shipped deduplication results favour sorted neighbourhood. |
-| `ncn-foreigners/BlockingPy` | Offline ANN backend comparison and blocking metrics | The live path (rebuilds the index per call; merges by connected components) | Read | To run in Phase 0 |
-| `janusza/ThreatTrace-Cyber-Attack-Detection` | Trace compaction, token embeddings, pooled `[count, mean, std, min, max]` vector; its FedCSIS data as a sanity check | Fuzzy c-means, which forces every trace into a cluster | Read | To run in Phase 0 (R notebooks) |
-| `YuchenZhang-Academic/Tracegram` | The formulation: per-instance encoder plus time-aware attention pooling, as a Phase 3 option | The 24-layer packet transformer (needs pcaps and a GPU) | Read | 29.8 ms per trace on an RTX 3080 Ti (paper) |
-| `ubc-provenance/orthrus` | The reconstruction algorithm, reimplemented on demand; per-attack ground truth via PIDSMaker | Postgres batch pipeline and the GNN | Read | Seed instability: ADP from 1.00 to below 0.1 on E3-THEIA (Bilot et al.) |
-| `ubc-provenance/PIDSMaker` | VELOX training as the per-event anomaly score; dataset converters; node-level ground truth; evaluation rules (multiple seeds, ADP) | The other detectors | Read | To run in Phase 0 on E3-CADETS |
-| `bogertaNET/Unveiling-CTAs` | The dataset: 94 actors, beacon sessions, timestamps, ATT&CK tags; the SCLC normalizer | Published scores (the split leaks) | Data inspected | Retrain on beacon-grouped and time-forward splits in Phase 0 |
-| `jev-sec/jev-ids` | Nothing | Everything (per-flow paid API, NSL-KDD only) | Read | — |
+| `ncn-foreigners/BlockingPy` | Offline ANN backend comparison and its blocking metrics (`eval()`) | The live path (rebuilds the index on every call, no incremental insert) and its connected-component blocks | **Run** | Tests pass; its benchmark reproduces (recall 0.90–0.91 at 15k records, 0.82 at 150k). On 9,988 CTA sessions, 86% of nearest-neighbour links join the same actor, but its connected components are only 67% pure: one block holds 1,031 sessions from 7 actors. Shared tooling chains actors together. |
+| `janusza/ThreatTrace-Cyber-Attack-Detection` | The pooled `[count, mean, std, min, max]` vector as one feature family; mined-pair compaction as an ablated option; FedCSIS as a sanity check | The R implementation (regex compaction, `max` for `pmax`), fuzzy c-means, label-token GloVe | **Run** | Six patches to run (outputs that don't chain, a miner that doesn't finish). Basic-feature baseline reproduces (0.540). XGBoost gain is +0.011 here vs +0.049 published (0.915 vs 0.940). Plain activity counts score 0.927. Regex compaction changes 26.5% of traces; std features depend only on n; c-means adds nothing. |
+| `YuchenZhang-Academic/Tracegram` | The formulation (a trace as a bag of instances with attention weights as evidence), as a Phase 3 option | The payload-based flow encoder; the claim that the temporal aggregator adds value | **Run** | Test F1 1.000 on bundled IoT-Sentinel reproduces, but mean-pooling the same flow vectors with 1-NN also scores 1.000. Its own logs show 0.876 without payload and an unreported dataset at 0.395. |
+ORTHRUS_ROW
+VELOX_ROW
+| `bogertaNET/Unveiling-CTAs` | The corpus (94 actors, 9,988 beacon sessions, timestamps, ATT&CK tactics) and the SCLC normalizer | The hybrid and BERT models; the random-split scores | **Run** | Shipped models reproduce exactly (0.951 / 0.938 / 0.893). TF-IDF + logistic regression beats them on the authors' own split (0.962 / 0.948 / 0.926). Time-forward, accuracy falls to 0.65–0.80 (hybrid 0.747 vs TF-IDF 0.797 at 4 actors). |
+| `jev-sec/jev-ids` | Nothing | Everything | **Run** | Tests pass and its table recomputes from shipped predictions. The headline comparison is with a random forest trained on 5 examples; it classifies single NSL-KDD flows through a paid API and covers none of the six stages. |
 
 Papers without separate code: AURA (adapt the retrieve-then-rank pattern with fixed scoring), TRACE (later: knowledge-graph extraction from reports), honeypot clustering (preprint link returns 403).
 
@@ -86,6 +98,51 @@ Corrections to `docs/sota/origin/md`:
 - *Sometimes Simpler is Better* reports its simple network leading on **eight of nine** DARPA datasets, not five of seven.
 - LogCloud's C++ implementation is `marsupialtail/logcloud`, and its Rust reimplementation is in `marsupialtail/rottnest`. `rottnest-vldb-repro` holds Rottnest's own benchmarks.
 - LogCrisp's trainer and compressor code is public, vendored inside `marsupialtail/logcloud`.
+
+### 2.1 What the reviews change, stage by stage
+
+Every linked repository has now been run here, on its own data, and the CTA corpus has been rebuilt with timestamps. In the order of the brief:
+
+1. **Ingest and retain searchable evidence (LogCrisp, LogCloud).**
+   - **Kept:** rottnest's Rust LogCloud over Parquet segments we write, and LogCrisp's template trainer.
+   - **What running it showed:** queries that cross a variable boundary return nothing, so search goes through the split-and-verify wrapper (§4.1). Templates are identified by content hashes because LogCrisp's IDs are per batch.
+   - **Still open:** the Phase 2 bake-off decides whether LogCloud stays at all.
+2. **Represent each trace's behaviour (ThreatTrace, Tracegram).**
+   - **The pooled vector is kept,** and neither repository shows that more is needed:
+     - **Tracegram's own data:** mean-pooling plus 1-NN ties its order-aware aggregator (1.000).
+     - **ThreatTrace's FedCSIS data:** plain activity counts score 0.927 with XGBoost, above every ThreatTrace configuration (0.910–0.920; 0.940 published).
+   - **Compaction:** ThreatTrace's regexes change 26.5% of traces, so compaction is reimplemented on tokens and kept only if the stage-2 ablation shows a gain. Per-trace std is computed correctly (ThreatTrace's is not).
+   - **No fuzzy c-means:** its memberships sum to 1 in every window, so nothing can be "none of the above".
+   - **No payload encoder:** Tracegram's encoder needs packet payload, which our telemetry lacks; its own logs drop to 0.876 without payload.
+   - **Baseline:** stage 2 must beat bag-of-activities counts, now measured on FedCSIS.
+3. **Retrieve a small candidate set (DynaHash, BlockingPy).**
+   - **DynaHash:** the authors' code, with its five defects fixed, is the LSH source.
+   - **BlockingPy:** offline backend comparison only.
+   - **Why connected components never become groups:** on real attacker sessions, nearest-neighbour links were 86% same-actor, but BlockingPy's connected components were only 67% pure, and one component held sessions from 7 actors. The signal is in individual links, not in their transitive closure, which is why the plan scores links and keeps groups overlapping.
+4. **Prioritize and score candidate relationships (Progressive Entity Matching).**
+   - **Unchanged:** sorted neighbourhood is primary, pyJedAI is pinned, and PESM is dropped because it does not reproduce.
+5. **Group and explain related activity (soft clustering, ORTHRUS).**
+   - **Anomaly score:** VELOX's per-edge loss. VELOX_RESULT
+   - **Reconstruction:**
+     - **What it is:** ORTHRUS's DepImpact algorithm, reimplemented over our temporal graph: from each flagged node, build a versioned DAG, trace back to entry and forward to exit nodes, score them, and report the union.
+     - **What we add:** windows are stitched together, because ORTHRUS reconstructs inside a single 15-minute window.
+   - **Evaluation:** never with ORTHRUS's two data-snooping practices: word2vec trained on test-period nodes, and k-means over the top-K test scores choosing the alert set.
+   - **Soft membership:** comes from calibrated links (§4.5), not fuzzy clustering.
+6. **Attribute groups to known actors (behavioural models, AURA).**
+   - **Classifier:** the execution-content classifier is TF-IDF + logistic regression. On the authors' own split it beats the published hybrid and all four BERT-family models: 0.962 / 0.948 / 0.926 against 0.951 / 0.938 / 0.893.
+   - **Evaluation:** attribution is evaluated time-forward only. Accuracy there is 0.65–0.80, so most command-only groups will end as *candidates* or *unresolved*, as designed.
+   - **Unchanged:** the AURA-style retrieve-then-rank over ATT&CK.
+
+**The repeated lesson.** In four of the six stages, the simpler method matched or beat the published complex one on the authors' own data:
+
+| Stage | Simpler method | Published complex method |
+|---|---|---|
+| 2 | mean-pooling | Tracegram's aggregator |
+| 5 | VELOX | ORTHRUS (Bilot et al.; VELOX_CONFIRM) |
+| 4 | sorted neighbourhood | NN + BFS for deduplication |
+| 6 | TF-IDF | the CTA hybrid |
+
+Decision 5 is therefore the plan's governing rule: every stage ships its simple baseline first, and a complex method replaces it only on a measured win.
 
 ## 3. System shape
 
@@ -174,9 +231,11 @@ Trace construction, using Tracegram's three strategies:
 The Phase 0 trace-boundary test (§8) checks this definition before features are built. Relations between traces (spawned-by, same process, connected-to) are kept as provenance edges.
 
 Features, all mergeable:
-- **Token stream:** template hashes, SCLC-normalized commands, or (action, object class) tokens. ThreatTrace compaction is applied at seal.
+- **Token stream:** template hashes, SCLC-normalized commands, or (action, object class) tokens.
+  - **Compaction:** run-length collapse and mined-pair substitution (ThreatTrace's rules), implemented on token arrays rather than ThreatTrace's string regexes, which corrupt 26.5% of traces.
+  - **Gated:** compaction is applied at seal only if the stage-2 ablation shows it beats uncompacted tokens.
 - **Shingle set:** 1–3-grams of tokens plus ATT&CK technique IDs, sketched with 128 MinHash functions.
-- **Pooled vector:** `[log n, mean, std, min, max]` of 64-d subword token vectors (fastText-style, over template text).
+- **Pooled vector:** `[log n, mean, std, min, max]` of 64-d subword token vectors (fastText-style, over template text). The std is per dimension per trace; ThreatTrace's version collapses it to a function of n.
   - The vectors are trained per modality and shipped with the parser vocabulary as one versioned artifact.
   - Unseen templates get vectors composed from their subwords, and the out-of-vocabulary rate is tracked as a drift signal.
   - 257 dimensions, int8-quantized, compared only within a modality.
@@ -186,7 +245,9 @@ Features, all mergeable:
   - At query time, keys present in more than max(100, 0.1% of indexed traces) traces are skipped as too common.
 - **Anomaly:** maximum and mean VELOX loss over member events.
 
-Phase 3 option: a MIL aggregator (instance MLP, time-gap encoding, gated attention pooling) trained with a supervised contrastive loss. It is adopted only if same-campaign recall@10 improves by at least 5 points over the pooled vector at no more than 2× the CPU cost.
+Phase 3 option: a MIL aggregator (instance MLP, time-gap encoding, gated attention pooling) trained with a supervised contrastive loss.
+- **Adoption rule:** it is adopted only if same-campaign recall@10 improves by at least 5 points over the pooled vector, at no more than 2× the CPU cost.
+- **Why the bar is set there:** on Tracegram's own data, mean-pooling with 1-NN already ties Tracegram's aggregator.
 
 ### 4.3 Retrieve a small candidate set (DynaHash, BlockingPy)
 
@@ -244,8 +305,9 @@ Explanation:
 - Per provenance member with anomalous nodes, on demand from a 48-hour in-memory temporal graph (older edges from RocksDB): ORTHRUS reconstruction.
   1. Take a 15-minute subgraph and convert it to a DAG.
   2. Trace backward and forward to the attack's entry and exit nodes.
-  3. Score each with criticality = mean of normalized out/in-degree and normalized anomaly.
+  3. Score each with criticality = mean of normalized out/in-degree and normalized anomaly. This is DepImpact's `degree_recon` option; ORTHRUS's default, `degree`, uses the degree ratio alone.
   4. Report the union of the critical dependency graphs.
+  5. Unlike ORTHRUS, which stays inside one 15-minute window, follow edges into adjacent windows until the entry or exit is found or the 48-hour horizon is reached.
 - Per group: a timeline across all members.
 
 Metrics: extended BCubed precision and recall; fragmentation; time to correct membership; seed stability. Quality of attribution (QoA): nodes to inspect per attack, and ADP.
@@ -256,7 +318,9 @@ Baselines: connected components over shared indicators (the failure mode to quan
 
 - **Knowledge base:** MITRE ATT&CK Enterprise STIX 2.1, versioned by hash. Optionally a local CTI report corpus searched with BM25.
 - **Evidence classes** are defined by where the observation came from:
-  - **Execution content** (commands, process trees, file operations): IDF-weighted technique and tool overlap, plus, for command traces, an open-set classifier. Start the classifier with TF-IDF + logistic regression and compare it with the CTA hybrid model. The two scorers are stacked into one jointly calibrated score, so they count as one class.
+  - **Execution content** (commands, process trees, file operations): IDF-weighted technique and tool overlap, plus, for command traces, an open-set classifier.
+    - **Classifier:** TF-IDF + logistic regression. On the authors' split it beats the CTA hybrid, and time-forward it scores 0.797 against the hybrid's 0.747 (4 actors). The hybrid is kept only as a challenger.
+    - **One evidence class:** the overlap and classifier scorers are stacked into one jointly calibrated score, so together they count as one class.
   - **Infrastructure** (C2 domains, IPs, certificates, JA3/JA4): time-decayed, low weight.
   - **Artifacts** (file hashes, malware family verdicts, named pipes and mutexes).
 - **Fusion:** a sum of calibrated log-likelihood ratios, one term per class, scored against an explicit unknown-actor hypothesis with its own prior.
@@ -374,11 +438,9 @@ This table is the evidence that each research area earns its place.
 
 **Phase 0: Assess and test the premises (weeks 1–3)**
 - Finish the assessments, one note each in `docs/assessment/`:
-  - VELOX in PIDSMaker on E3-CADETS: reproduce ADP over 3 seeds and measure CPU inference speed;
-  - ORTHRUS ground truth loaded and checked;
-  - the ThreatTrace notebooks on their FedCSIS data;
-  - BlockingPy on a trace-shaped corpus;
-  - the CTA classifier under random, beacon-grouped and time-forward splits.
+  - **Done:** every linked repository has been run once (§2, §2.1).
+  - **Left for Phase 0:** VELOX_PHASE0
+  - **Next:** the CTA classifier under beacon-grouped and open-set splits; the time-forward split is already measured.
 - E3-CADETS converter to Event Parquet, plus ground-truth manifests and split files.
 - `third_party/` with pinned versions and fixes:
   - DynaHash, with the five fixes and regression tests;
@@ -422,16 +484,9 @@ Deferred until the core loop works: an analyst UI beyond the static report, LLM 
 
 - **Actor labels are scarce.** Public data supports actor ranking only for command traces (CTA) and a single emulated actor (Carbanak). *Attributed* depends on the emulation lab, which measures documented behaviour, not real actors.
 - **Shared tooling.** Cobalt Strike and living-off-the-land binaries make cross-actor similarity common. Measure the false-link rate between actors that use the same framework.
-- **Seed instability.** Learned detectors vary widely across seeds (ORTHRUS ADP 1.00 to below 0.1). Report variance; use seed averaging.
+- **Seed instability.** Learned detectors vary widely across seeds (ORTHRUS ADP from 0.10 to 1.00 on E3-THEIA, Bilot et al.). Report variance; use seed averaging.
 - **Sensor dependence.** Train per sensor family and test across sensors.
-- **Research code reliability.** Every artifact run so far had at least one defect that would have corrupted results:
-  - wrong formulas;
-  - silent record loss;
-  - missed search results;
-  - crashes;
-  - broken installs.
-
-  The remaining artifacts are assessed the same way in Phase 0.
+- **Research code reliability.** Eight of the eleven repositories had at least one problem that would have changed results or blocked a run (decision 2). Only BlockingPy, Tracegram and jev-ids ran cleanly and reproduced as shipped. Even so, a pooled baseline ties Tracegram's aggregator. Every adopted component is therefore pinned, patched in `third_party/`, regression-tested against the original, and re-run when upgraded.
 - **LogCloud fit.** Boundary-crossing queries need the wrapper. Templates are per-batch. The newest data must be scanned directly. On local disk, plain scans may be as fast at workstation scale: the Phase 2 bake-off decides.
 - **Python throughput.** The 100k events/s target may need Rust ports of normalization and hashing. Decide after profiling, not before.
 - **Adversarial manipulation.** Out of scope for Phases 1–3 and recorded as a known gap.
