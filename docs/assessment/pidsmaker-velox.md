@@ -64,7 +64,7 @@ Run 2 detail:
   - the evaluation rules (ADP, at least 5 seeds, no test data in features or thresholds).
 - **Not relied on:** VELOX as the stage-5 anomaly score, until it reproduces.
 - **Plan status:**
-  - **Phase 0:** reproduce VELOX on a GPU machine with 5 seeds from the `velox` branch.
+  - **Version 2:** reproduce VELOX on a GPU machine with 5 seeds from the `velox` branch. Version 1 does not use a learned anomaly score.
   - **Fallback:** a simple frequency-based edge-rarity score, measured with the same ADP protocol.
   - **What stage 5 is seeded from in the meantime:** the anomaly score is one input to prioritization and explanation, not a gate, and reconstruction can also start from strong pair links and indicator hits.
 

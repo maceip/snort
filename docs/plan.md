@@ -45,11 +45,11 @@ Scope: one person, one workstation, one process, demonstrating all six stages fr
 
 Any design that turns similarity directly into a label mislabels at a rate an analyst cannot accept: blocking components, hard clusters, or one classifier's argmax. That is the measured case for overlapping groups and "unresolved".
 
-**Why these components, and not the obvious alternatives:**
+**Why these components, and not the obvious alternatives** (the full design; version 1 builds the smallest subset, see the next section):
 
 | Stage | Choice | Rejected alternative | Measured reason |
 |---|---|---|---|
-| 1 Ingest | Parquet we write, indexed by rottnest's Rust LogCloud, with split-and-verify search | C++ LogCloud; grep alone | C++ missed 22 of 40 lookups at 961 MB; Rust found 40 of 40 in about 1.3 s. A Phase 2 bake-off against plain scans decides whether the index stays |
+| 1 Ingest | Parquet we write, indexed by rottnest's Rust LogCloud, with split-and-verify search | C++ LogCloud; grep alone | C++ missed 22 of 40 lookups at 961 MB; Rust found 40 of 40 in about 1.3 s. A version 2 bake-off against plain scans decides whether the index stays |
 | 2 Represent | Activity counts, pooled token vectors, MinHash, timing, all mergeable per event | ThreatTrace's pipeline; Tracegram's aggregator | Counts 0.927 vs ThreatTrace 0.915 on its own data; pooled 1-NN ties Tracegram (1.000). Both alternatives recompute in batch |
 | 3 Retrieve | DynaHash (fixed), HNSW and indicators, capped at 50 | BlockingPy's components | Links are 86% pure, components 67%. BlockingPy rebuilds its index on every call |
 | 4 Score | Sorted-neighbourhood scheduling, calibrated pair model | NN + BFS; PESM | PER's own deduplication results favour sorted neighbourhood; PESM does not reproduce |
@@ -61,7 +61,7 @@ Any design that turns similarity directly into a label mislabels at a rate an an
 2. Does trace-level similarity separate same-attack pairs from unrelated pairs on provenance data, not only on commands?
 3. Does the loop keep up at 10× replay on one machine?
 
-Phase 0's go/no-go tests answer 1 and 2 within three weeks; Phase 1 answers 3.
+Version 1's go/no-go tests answer 1 and 2 in its first two weeks; the version 1 replay answers 3.
 
 **What would change the plan:**
 - **Trace boundaries fail (go/no-go 1):** redefine them (for example, session or beacon instead of process subtree) before building anything on them.
@@ -77,15 +77,49 @@ Phase 0's go/no-go tests answer 1 and 2 within three weeks; Phase 1 answers 3.
 
 Nothing on the live path needs a GPU.
 
+## Version 1: the smallest system that shows all six stages
+
+**Goal:** version 1 demonstrates every concept end to end, from ingestion and search through grouping and attribution, with the best chance of working and the least complexity. Three rules decide what is in it:
+1. **Proven parts only.** Every component either ran here on its own data or is standard library code. Nothing depends on a result that failed to reproduce (VELOX), on a GPU, or on data we do not have.
+2. **One simple method per stage.** Challengers, tuning and scale wait for version 2.
+3. **Two datasets, both already loaded and checked here:**
+   - **DARPA E3-CADETS** (restored, 36.5M events; ground truth for 72 attack nodes) for grouping and attack reconstruction.
+   - **The Unveiling-CTAs corpus** (rebuilt with session timestamps; 94 actors) for attribution. It is the only public data with actor labels.
+
+**What version 1 builds, stage by stage:**
+
+| Stage | Version 1 builds | Deferred to version 2 | Why deferring is safe |
+|---|---|---|---|
+| 1 Ingest and search | Readers for the E3-CADETS database and CTA JSON. Hash-chained append-only segments sealed to zstd Parquet. `snort index` builds a rottnest LogCloud index over sealed segments as a batch step. `snort search` runs split-and-verify on indexed segments and DuckDB scans on the rest | Drain/LogCrisp templates, which raw text logs need and both datasets lack; live indexing in a helper process; the bake-off at 100 GB or more | Both sources are structured, and batch indexing shows search over retained evidence without a second live process |
+| 2 Represent | Traces: the process subtree under a session root (E3) and the beacon session (CTA). Features: TF-IDF token counts, a 128-function MinHash of 1–3-gram shingles, duration and event count, ATT&CK tactic or technique tags, and indicators | Pooled embeddings, compaction, timing histograms, MIL | Counts beat ThreatTrace's representation on its own data (0.927 vs 0.915), and TF-IDF reached 0.96 on CTA |
+| 3 Retrieve | DynaHash with its five fixes, over MinHash; an exact indicator index; provenance joins (E3); at most 50 candidates | HNSW, group-prototype index | DynaHash recall reproduced at 0.96–0.99; links found this way were 86% same-actor on CTA |
+| 4 Prioritize and score | Best-first progressive queue: each trace's candidates are scored in order of estimated similarity, under a per-second comparison budget. Pair model: logistic regression with isotonic calibration on about 8 features (MinHash Jaccard, TF-IDF cosine, IDF-weighted shared indicators, technique overlap, provenance path within 15 minutes, time gap) | Sorted-neighbourhood keys in RocksDB, LightGBM, sequence-alignment features | Best-first is the simplest form of PER's core idea (spend the next comparison on the most promising pair). Logistic coefficients are the explanation, so no TreeSHAP is needed |
+| 5 Group and explain | Up to three memberships per trace, plus "unassigned" (rules in §4.5). Per-membership evidence: feature contributions, plus shared shingles and indicators pointing at event hashes. For E3 groups, DepImpact-style backward and forward reconstruction seeded from group members, stitched across 15-minute windows. Edge rarity orders the work | VELOX, nightly Leiden audit, merge and split proposals | Seeding reconstruction from groups removes the dependency on a detector that did not reproduce |
+| 6 Attribute | Fusion against an explicit unknown actor: TF-IDF + logistic regression over the group's command traces, plus technique overlap. Output is *candidates* or *unresolved* only. Held-out CTA actors must come out *unresolved*. E3-CADETS has no actor labels, so its groups come out *unresolved*, which demonstrates abstention. ATT&CK group profiles that share the observed techniques are shown as context but not scored | The *attributed* level and the emulation lab; infrastructure and artifact evidence classes; CTI-report retrieval; LLM-drafted explanations | Time-forward accuracy (0.65–0.80) supports ranking candidates, not naming actors |
+| Lineage | BLAKE3 chain over raw segments and every decision record; `snort verify` | Signed chain heads, external copies | The chain alone makes edits detectable |
+
+**Why this has the best chance of working:**
+- **Proven components:** the ingest index (rottnest), the LSH (DynaHash), the classifier (TF-IDF + LR) and both datasets were all exercised here.
+- **Little new code:** what is new is mostly glue and the trace assembler, written in plain Python with Polars, DuckDB and scikit-learn.
+- **Unproven premises are tested first:** trace boundaries and separability are checked in the first two weeks, before the rest is built (§8).
+
 ## 0. Definition of done
 
-One command, `snort demo`, on the reference workstation and from a clean checkout:
-1. Replays DARPA E3-CADETS, then the composite stream (§7.1), at 10× real time.
-2. Produces groups of related traces with their evidence, ORTHRUS-style attack graphs, and for each group either ranked actor candidates or "unresolved".
-3. Passes `snort verify` on the decision ledger.
-4. Writes a metrics report comparing every stage with its baseline, plus the ablation table (§7.4).
+**Version 1:** one command, `snort demo`, on the reference workstation and from a clean checkout:
+1. Replays DARPA E3-CADETS and the CTA corpus at 10× real time through the same pipeline.
+2. Answers evidence searches over the retained segments, with recall checked against grep.
+3. Produces groups of related traces:
+   - each trace can belong to several groups, or stay unassigned;
+   - each membership carries its evidence;
+   - E3 groups also get reconstructed attack graphs.
+4. Gives each group ranked actor candidates or "unresolved", and held-out CTA actors come out "unresolved".
+5. Passes `snort verify` on the decision ledger.
+6. Writes a metrics report comparing every stage with its baseline, plus three ablations:
+   - no LSH (indicators only);
+   - FIFO instead of best-first ordering;
+   - cosine threshold instead of the pair model.
 
-Everything in this plan exists to make that command produce honest numbers.
+**Version 2** adds the composite stream, the emulation lab and the *attributed* level, and the full ablation table (§7). Everything in this plan exists to make that command produce honest numbers.
 
 ## 1. Decisions
 
@@ -106,7 +140,7 @@ Everything in this plan exists to make that command produce honest numbers.
 
    Each adopted repository is therefore reproduced on its own data, pinned, given regression tests, and written up in `docs/assessment/` before its numbers are trusted. Status is in §2.
 3. **One dataset end to end before adding more.** E3-CADETS first (about 10 GB, three attacks, node-level ground truth). Then THEIA and CLEARSCOPE, then the composite stream.
-4. **Go/no-go tests before building on assumptions.** Two tests run in Phase 0:
+4. **Go/no-go tests before building on assumptions.** Two tests run in the first two weeks of version 1:
    - whether the trace definition keeps each attack in a few pure traces;
    - whether behavioural similarity separates traces from the same attack from unrelated ones.
 
@@ -135,7 +169,7 @@ Everything in this plan exists to make that command produce honest numbers.
 11. **Attribution is a separate layer with an explicit "unknown actor" hypothesis.**
     - **Default output:** ranked candidates or "unresolved".
     - **The "attributed" level stays off** until its precision is measured across at least three held-out actors with independent evidence.
-    - **Where that data comes from:** an emulation lab built in Phase 3 (§7.1), because no public dataset provides it.
+    - **Where that data comes from:** an emulation lab built in version 2 (§7.1), because no public dataset provides it.
     - **LLMs:** may draft explanations from cited evidence; they never set scores.
 12. **Lineage is tamper-evident, not tamper-proof.** A BLAKE3 hash chain covers raw segments and every derived decision. Chain heads are signed with a key held outside the process; external copies of the heads, which make rollback detectable, are added once the core loop works.
 
@@ -153,7 +187,7 @@ Status meanings:
 | `JacobMaciejewski/PER-Design-Space-Exploration` | Runner and configs over pinned pyJedAI as the scheduling benchmark; sorted neighbourhood as the primary method | NN + BFS as the default | **Run** | Join reproduces exactly and sorted neighbourhood closely; PESM does not (unpinned pyJedAI). NN embedding took about 6 s per record on CPU. Shipped deduplication results favour sorted neighbourhood. |
 | `ncn-foreigners/BlockingPy` | Offline ANN backend comparison and its blocking metrics (`eval()`) | The live path (rebuilds the index on every call, no incremental insert) and its connected-component blocks | **Run** | Tests pass; its benchmark reproduces (recall 0.90–0.91 at 15k records, 0.82 at 150k). On 9,988 CTA sessions, 86% of nearest-neighbour links join the same actor, but its connected components are only 67% pure: one block holds 1,031 sessions from 7 actors. Shared tooling chains actors together. |
 | `janusza/ThreatTrace-Cyber-Attack-Detection` | The pooled `[count, mean, std, min, max]` vector as one feature family; mined-pair compaction as an ablated option; FedCSIS as a sanity check | The R implementation (regex compaction, `max` for `pmax`), fuzzy c-means, label-token GloVe | **Run** | Six patches to run (outputs that don't chain, a miner that doesn't finish). Basic-feature baseline reproduces (0.540). XGBoost gain is +0.011 here vs +0.049 published (0.915 vs 0.940). Plain activity counts score 0.927. Regex compaction changes 26.5% of traces; std features depend only on n; c-means adds nothing. |
-| `YuchenZhang-Academic/Tracegram` | The formulation (a trace as a bag of instances with attention weights as evidence), as a Phase 3 option | The payload-based flow encoder; the claim that the temporal aggregator adds value | **Run** | Test F1 1.000 on bundled IoT-Sentinel reproduces, but mean-pooling the same flow vectors with 1-NN also scores 1.000. Its own logs show 0.876 without payload and an unreported dataset at 0.395. |
+| `YuchenZhang-Academic/Tracegram` | The formulation (a trace as a bag of instances with attention weights as evidence), as a version 2 option | The payload-based flow encoder; the claim that the temporal aggregator adds value | **Run** | Test F1 1.000 on bundled IoT-Sentinel reproduces, but mean-pooling the same flow vectors with 1-NN also scores 1.000. Its own logs show 0.876 without payload and an unreported dataset at 0.395. |
 | `ubc-provenance/orthrus` | The DepImpact reconstruction algorithm, reimplemented with cross-window stitching; per-attack ground truth; evaluation rules | The GNN; the original config, which uses test data for word2vec and picks alerts by k-means over top test scores | **Read** (its reconstruction has not been run yet; see `orthrus.md`) | Reconstruction stays inside one 15-minute window. Not exactly reproducible (README: unset `PYTHONHASHSEED`). Non-snooped ADP on E3-CADETS is 0.94 (min 0.85), the same as VELOX (Bilot et al.). |
 | `ubc-provenance/PIDSMaker` | Dataset dumps and converters; node-level ground truth; evaluation rules (5 seeds, ADP); VELOX only once it reproduces | The other detectors | **Run** | E3-CADETS restored (36.5M events). Graphs build in 4 min on CPU. VELOX did **not** reproduce: best ADP 0.143 against 0.94 published, across `main` default (0.008), `main` tuned (0.007) and the paper's `velox` branch with its tuned file (0.143). `main` lacks the tuned file, and its docs disagree with the branch. Training needed a memory patch to fit 15 GB. |
 | `bogertaNET/Unveiling-CTAs` | The corpus (94 actors, 9,988 beacon sessions, timestamps, ATT&CK tactics) and the SCLC normalizer | The hybrid and BERT models; the random-split scores | **Run** | Shipped models reproduce exactly (0.951 / 0.938 / 0.893). TF-IDF + logistic regression beats them on the authors' own split (0.962 / 0.948 / 0.926). Time-forward, accuracy falls to 0.65–0.80 (hybrid 0.747 vs TF-IDF 0.797 at 4 actors). |
@@ -173,7 +207,7 @@ Every linked repository has now been run here, on its own data, and the CTA corp
 1. **Ingest and retain searchable evidence (LogCrisp, LogCloud).**
    - **Kept:** rottnest's Rust LogCloud over Parquet segments we write, and LogCrisp's template trainer.
    - **What running it showed:** queries that cross a variable boundary return nothing, so search goes through the split-and-verify wrapper (§4.1). Templates are identified by content hashes because LogCrisp's IDs are per batch.
-   - **Still open:** the Phase 2 bake-off decides whether LogCloud stays at all.
+   - **Still open:** the version 2 bake-off decides whether LogCloud stays at all.
 2. **Represent each trace's behaviour (ThreatTrace, Tracegram).**
    - **The pooled vector is kept,** and neither repository shows that more is needed:
      - **Tracegram's own data:** mean-pooling plus 1-NN ties its order-aware aggregator (1.000).
@@ -270,6 +304,8 @@ flowchart LR
 
 ## 4. Stage designs
 
+This section is the full design. Version 1 builds only the subset listed in "Version 1" above; the rest is version 2.
+
 ### 4.1 Ingest and retain searchable evidence (LogCloud, LogCrisp)
 
 - **Inputs:** DARPA CDM (via PIDSMaker converters), OpTC eCAR, Sysmon/EDR JSON, auditd, Zeek, and CTA command JSON, all normalized to the Event schema in Arrow micro-batches.
@@ -284,7 +320,7 @@ flowchart LR
   4. Scan unsealed and not-yet-indexed segments directly with Polars or DuckDB.
 - **Aggregation:** DuckDB over the Parquet segments.
 - **Hot state:** RocksDB holds entities, open traces, the DynaHash DB and indicator postings.
-- **Stage-1 bake-off (Phase 2):**
+- **Stage-1 bake-off (version 2):**
   - **Data:** at least 100 GB of real telemetry.
   - **Compared:** LogCloud + wrapper against zstd Parquet + DuckDB, and against ripgrep over zstd files.
   - **Measured:** recall against grep, latency, disk and indexing CPU.
@@ -296,9 +332,9 @@ flowchart LR
 Trace construction, using Tracegram's three strategies:
 - **Host trace:** the process subtree under a session root, meaning the first ancestor below a service boundary (sshd, winlogon, services, browser, office, script host, implant). Closed after 30 minutes idle or 24 hours; long-lived roots get rolling windows.
 - **Command trace:** one shell session or beacon ID.
-- **Network trace:** one source host to one destination group, split on idle gaps, plus a 24-hour profile per host. Phase 3.
+- **Network trace:** one source host to one destination group, split on idle gaps, plus a 24-hour profile per host. Version 2.
 
-The Phase 0 trace-boundary test (§8) checks this definition before features are built. Relations between traces (spawned-by, same process, connected-to) are kept as provenance edges.
+The version 1 trace-boundary test (§8) checks this definition before features are built. Relations between traces (spawned-by, same process, connected-to) are kept as provenance edges.
 
 Features, all mergeable:
 - **Token stream:** template hashes, SCLC-normalized commands, or (action, object class) tokens.
@@ -316,7 +352,7 @@ Features, all mergeable:
   - At query time, keys present in more than max(100, 0.1% of indexed traces) traces are skipped as too common.
 - **Anomaly:** maximum and mean per-edge anomaly score over member events. The score is VELOX loss if it reproduces, otherwise edge rarity (§2.1).
 
-Phase 3 option: a MIL aggregator (instance MLP, time-gap encoding, gated attention pooling) trained with a supervised contrastive loss.
+Version 2 option: a MIL aggregator (instance MLP, time-gap encoding, gated attention pooling) trained with a supervised contrastive loss.
 - **Adoption rule:** it is adopted only if same-campaign recall@10 improves by at least 5 points over the pooled vector, at no more than 2× the CPU cost.
 - **Why the bar is set there:** on Tracegram's own data, mean-pooling with 1-NN already ties Tracegram's aggregator.
 
@@ -429,7 +465,7 @@ Reference machine: 32 cores, 256 GB ECC RAM, two 4 TB NVMe drives (one for WAL a
 
 | Item | Target or measured figure |
 |---|---|
-| Sustained ingest (normalize + hash + WAL + parse), Python micro-batches | Phase 1 target 20k events/s (about 10× the DARPA E5-CADETS peak of 1,832 edges/s); 100k events/s only after profiling and porting the measured hot spots |
+| Sustained ingest (normalize + hash + WAL + parse), Python micro-batches | Version 1 target 20k events/s (about 10× the DARPA E5-CADETS peak of 1,832 edges/s); 100k events/s only after profiling and porting the measured hot spots |
 | Segment indexing | Measured about 4–5 MB/s per indexing job on 4 cores. 100 GB/day of logs averages 1.2 MB/s, so one job keeps up with headroom; the unindexed tail is scanned directly. |
 | Event → trace feature update | p95 < 1 s |
 | Sealed trace → memberships | p95 < 5 s at 10× replay |
@@ -443,7 +479,7 @@ Reference machine: 32 cores, 256 GB ECC RAM, two 4 TB NVMe drives (one for WAL a
 
 Ground truth has three levels: **incident** (one attack execution), **campaign** (the same operator and toolset across incidents or hosts) and **actor** (a named group).
 
-Datasets in the order they are used:
+Datasets in the order they are used. Version 1 uses only E3-CADETS and the CTA corpus; the rest are version 2:
 
 | Order | Dataset | Modality | Levels | Use |
 |---|---|---|---|---|
@@ -452,8 +488,8 @@ Datasets in the order they are used:
 | 3 | Unveiling-CTAs corpus | commands | session, actor (94) | behavioural attribution ranking, open-set |
 | 4 | OpTC h051/h201/h501, ATLASv2, CARBANAKv2 | Windows EDR | incident; Carbanak emulation | composite background and attacks |
 | 5 | Composite stream | Windows EDR + commands | all three | end-to-end replay |
-| 6 | Emulation lab (built in Phase 3) | Sysmon, Zeek, file evidence | actor (4–6 emulated actors) | the only measurement of *attributed* |
-| — | E5-TRACE (710 GB), E5-FIVEDIRECTIONS (280 GB) | provenance | incident | scale and latency (Phase 3) |
+| 6 | Emulation lab (built in version 2) | Sysmon, Zeek, file evidence | actor (4–6 emulated actors) | the only measurement of *attributed* |
+| — | E5-TRACE (710 GB), E5-FIVEDIRECTIONS (280 GB) | provenance | incident | scale and latency (version 2) |
 | — | DAPT2020, Tracegram datasets, FedCSIS 2023 | network, audit | trace | network traces and representation checks |
 
 **Composite stream.**
@@ -477,7 +513,7 @@ Injected activity is easier to separate than organic activity, so composite resu
   - Open-set: 20% of actors are held out, split into disjoint validation and test sets. Every attribution input is built per split, removing held-out actors from classifier training, the ATT&CK snapshot, the CTI corpus and indicator lists.
 - **Seeds:** at least 5 for every learned component, reporting mean, min and max.
 - **Thresholds:** fit on validation data, never on test.
-- **Targets:** relative to measured baselines (for example "beat indicator-only grouping on BCubed F1 by 0.10"), set once Phase 0 baselines exist. The fixed numbers in §4 are starting points.
+- **Targets:** relative to measured baselines (for example "beat indicator-only grouping on BCubed F1 by 0.10"), set once version 1 baselines exist. The fixed numbers in §4 are starting points.
 - **Cost:** CPU-hours, peak RAM, and disk per day of telemetry, reported throughout.
 
 ### 7.3 Metrics by stage
@@ -507,52 +543,61 @@ This table is the evidence that each research area earns its place.
 
 ## 8. Delivery plan (one person)
 
-**Phase 0: Assess and test the premises (weeks 1–3)**
-- Finish the assessments, one note each in `docs/assessment/`:
-  - **Done:** every linked repository has been run once (§2, §2.1).
-  - **Left for Phase 0:**
-    - **VELOX on a GPU:** VELOX did not reproduce on CPU (best ADP 0.143 against 0.94), so re-run it on a GPU with 5 seeds from the paper's `velox` branch.
-    - **Fallback score:** compare it with an edge-rarity score under the same ADP protocol.
-    - **Reconstruction:** run DepImpact on the score that passes.
-  - **Next:** the CTA classifier under beacon-grouped and open-set splits; the time-forward split is already measured.
-- E3-CADETS converter to Event Parquet, plus ground-truth manifests and split files.
-- `third_party/` with pinned versions and fixes:
-  - DynaHash, with the five fixes and regression tests;
-  - PER runner + pyJedAI, pinned;
+### Version 1 (weeks 1–9)
+
+**Weeks 1–2: data and the two go/no-go tests.**
+- Converters: E3-CADETS (from the restored database) and the CTA corpus (from the rebuilt sessions) to Event Parquet, plus ground-truth manifests and time-forward split files.
+- `third_party/`, pinned:
+  - DynaHash with its five fixes and regression tests against the original;
   - rottnest 1.5.0 + `getdaft==0.3.15`.
-- **Go/no-go 1, trace boundaries:** on E3-CADETS, how many traces each attack's labelled nodes fall into, and what share of each such trace is attack activity. Pass: each attack falls mostly into 3 or fewer traces, and those traces are mostly attack activity. Exact cut-offs are fixed before looking at the results.
-- **Go/no-go 2, separability:** the distributions of MinHash Jaccard and pooled-vector cosine for same-attack trace pairs against random pairs. Pass: AUC ≥ 0.8 for at least one representation.
+- **Go/no-go 1, trace boundaries:** on E3-CADETS, how many traces each attack's labelled nodes fall into, and what share of each such trace is attack activity.
+  - **Pass:** each attack falls mostly into 3 or fewer traces, and those traces are mostly attack activity.
+  - **Cut-offs:** fixed before looking at the results.
+- **Go/no-go 2, separability:** MinHash Jaccard and TF-IDF cosine for same-attack pairs against random pairs, on E3-CADETS. **Pass:** AUC ≥ 0.8 for at least one of them. (The same measure on CTA same-actor pairs is already known to be high: 86% nearest-neighbour purity.)
+- **Exit:** both tests decided with numbers. If one fails, redesign trace boundaries or features before building further.
 
-Exit: both tests decided with numbers. If a test fails, Phase 1 starts with a redesign of trace boundaries or features.
+**Weeks 3–6: the pipeline.**
+- **Ingest:** segments, Parquet, `snort index` and `snort search`.
+- **Representation:** trace assembler and features.
+- **Retrieval and scoring:** DynaHash, the indicator index, the best-first queue and the logistic pair model.
+- **Grouping:** memberships with "unassigned".
+- **Explanation and attribution:** evidence, DepImpact-style reconstruction for E3 groups, and attribution against the unknown actor.
+- **Lineage:** ledger and `snort verify`.
 
-**Phase 1: E3-CADETS end to end (weeks 4–9)**
-- Ingest → WAL → Parquet → LogCloud helper with the search wrapper → traces → features.
-- DynaHash, HNSW and the indicator index.
-- Sorted-neighbourhood scheduler; LightGBM pair model.
-- Groups, ORTHRUS reconstruction, ledger and `verify`.
-- Report with baselines and 5 seeds.
+**Weeks 7–8: evaluation.**
+- **Search:** recall against grep, and latency.
+- **Retrieval:** neighbour recall.
+- **Scoring:** progressive recall against FIFO.
+- **Grouping:** BCubed against indicator-only connected components.
+- **Explanation:** nodes to inspect per E3 attack.
+- **Attribution:** time-forward top-1 and top-3, unknown-actor AUROC, and precision at coverage on CTA.
+- **Ablations:** the three ablations, with 5 seeds wherever anything is random.
 
-Exit: `snort demo --dataset e3-cadets` produces the report; every stage beats its baseline or the report says why not.
+**Week 9: the report and a clean-checkout run of `snort demo`.**
 
-**Phase 2: Widen and attribute (weeks 10–15)**
-- THEIA and CLEARSCOPE (cross-sensor, cross-host campaign).
-- The composite stream with overlap scenarios.
-- Attribution on the CTA corpus (candidates and unresolved, open-set).
-- The stage-1 bake-off at ≥ 100 GB.
-- Profiling, with Rust ports only where measured.
+**Exit:** version 1's definition of done (§0) holds, and every stage either beats its baseline or the report says why not.
 
-Exit: the composite run in the report, with attribution ranking and unknown-actor metrics.
+### Version 2 (weeks 10–24), each item only after version 1 works
+- **More data:** THEIA and CLEARSCOPE (cross-sensor, cross-host campaigns); the composite stream with overlap scenarios.
+- **Retesting what did not reproduce:**
+  - VELOX on a GPU with 5 seeds from the paper's `velox` branch, against an edge-rarity score;
+  - the winner becomes the anomaly score.
+- **Stronger methods, each adopted only if it beats the version 1 method:**
+  - HNSW;
+  - pooled embeddings;
+  - sorted-neighbourhood scheduling;
+  - LightGBM;
+  - MIL aggregator.
+- **Raw logs:** Drain/LogCrisp templates, and the stage-1 bake-off at 100 GB or more.
+- **The *attributed* level:** the emulation lab, used to decide whether *attributed* is turned on.
+- **Scale:** a scale replay (E5-TRACE or OpTC volume), with Rust ports only where profiling shows a bottleneck.
+- **Evaluation:** the full ablation table (§7.4).
 
-**Phase 3: Emulation lab, scale, ablations (weeks 16–24)**
-- Emulation lab data, used to measure *attributed* and decide whether it is turned on.
-- MIL aggregator under its adoption rule.
-- Network traces.
-- A scale replay (E5-TRACE or OpTC volume).
-- The full ablation table and a written evaluation.
-
-Exit: §0 holds.
-
-Deferred until the core loop works: an analyst UI beyond the static report, LLM explanations, external copies of chain heads, multi-node.
+Deferred beyond version 2:
+- an analyst UI beyond the static report;
+- LLM explanations;
+- external copies of chain heads;
+- multi-node operation.
 
 ## 9. Risks and open questions
 
@@ -564,7 +609,7 @@ Deferred until the core loop works: an analyst UI beyond the static report, LLM 
   - **Response:** report variance, average over seeds, and keep a simple non-learned score as the fallback.
 - **Sensor dependence.** Train per sensor family and test across sensors.
 - **Research code reliability.** Eight of the eleven repositories had at least one problem that would have changed results or blocked a run (decision 2). Only BlockingPy and Tracegram ran cleanly and reproduced as shipped. jev-ids's tests pass, but its detector is a paid API that could not be re-run, so only its metric table was checked. Even so, a pooled baseline ties Tracegram's aggregator. VELOX's published detection result did not reproduce. Every adopted component is therefore pinned, patched in `third_party/`, regression-tested against the original, and re-run when upgraded.
-- **LogCloud fit.** Boundary-crossing queries need the wrapper. Templates are per-batch. The newest data must be scanned directly. On local disk, plain scans may be as fast at workstation scale: the Phase 2 bake-off decides.
+- **LogCloud fit.** Boundary-crossing queries need the wrapper. Templates are per-batch. The newest data must be scanned directly. On local disk, plain scans may be as fast at workstation scale: the version 2 bake-off decides.
 - **Python throughput.** The 100k events/s target may need Rust ports of normalization and hashing. Decide after profiling, not before.
 - **Adversarial manipulation.** Out of scope for Phases 1–3 and recorded as a known gap.
 - **Name.** Snort is an established open-source IDS (Cisco). Consider renaming before anything public.
@@ -589,7 +634,7 @@ lab/
   convert/      DARPA CDM, OpTC, ATLASv2, CARBANAKv2, CTA → Event Parquet
   train/        token embeddings, VELOX (PIDSMaker), pair model, actor models
   eval/         metrics, splits, reports, go/no-go tests
-  emulation/    lab build scripts and run manifests (Phase 3)
+  emulation/    lab build scripts and run manifests (version 2)
 bench/          dataset manifests, ground truth, replay specs, results
 docs/
   assessment/   one note per repository, with reproduction commands

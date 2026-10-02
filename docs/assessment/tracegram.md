@@ -39,7 +39,7 @@ Environment: 4-core cloud container, CPU only, Python 3.12, torch 2.14 (CPU). `Y
 
 - **What carries over:** the formulation (a trace is a bag of instances, scored with per-instance attention that doubles as evidence).
 - **What doesn't:** the shipped results do not show the temporal aggregator adding value over pooled features, and the payload-dependent encoder does not fit flow-level telemetry.
-- **Plan status:** stays a Phase 3 option.
+- **Plan status:** stays a version 2 option.
 - **Adoption test:** it must beat the pooled `[count, mean, std, min, max]` vector on our own traces under the plan's rule (§4.2), using flow and event features without payload, before it is adopted.
 
 ## Reproduce

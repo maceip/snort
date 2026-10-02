@@ -59,7 +59,7 @@ Environment: 4-core cloud container, 15 GB RAM, CPU only. `ubc-provenance/orthru
 ORTHRUS itself was not trained here; its code and configurations were read. The plan was to run DepImpact through PIDSMaker's triage stage on VELOX detections, but it did not run:
 - **The options were ignored:** on `main` the `--triage.*` options were not applied, and no triage step appeared in the log.
 - **No useful starting points:** the detector it would start from did not reproduce. The best VELOX run flagged at most 1 attack node among 135–180 alerts, so reconstruction would mostly have traced benign activity.
-- **Not yet measured:** reconstruction quality (nodes to inspect per attack) is a Phase 0 item, run on whichever anomaly score passes the ADP check.
+- **Not yet measured:** reconstruction quality (nodes to inspect per attack) is measured in version 1, with reconstruction seeded from group members rather than from a detector.
 
 ## Verdict
 
