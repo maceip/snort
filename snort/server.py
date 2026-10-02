@@ -329,11 +329,14 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       display: flex;
       justify-content: space-between;
       align-items: center;
+      flex-wrap: wrap;
+      gap: 16px;
       padding-bottom: 20px;
       border-bottom: 1px solid var(--card-border);
       margin-bottom: 24px;
     }
     .brand { display: flex; align-items: center; gap: 12px; }
+    .header-actions { display: flex; flex-wrap: wrap; gap: 8px; }
     .brand h1 { font-size: 24px; letter-spacing: -0.5px; color: var(--text); }
     .badge {
       background: rgba(16, 185, 129, 0.15);
@@ -344,7 +347,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       font-size: 12px;
       font-weight: 600;
     }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; margin-bottom: 24px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); gap: 16px; margin-bottom: 24px; }
     .card {
       background: var(--card);
       border: 1px solid var(--card-border);
@@ -356,12 +359,14 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     .card-sub { font-size: 12px; color: var(--muted); margin-top: 4px; word-break: break-all; }
 
     .section { background: var(--card); border: 1px solid var(--card-border); border-radius: 10px; padding: 24px; margin-bottom: 24px; }
-    .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+    .section-header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+    .section-note { font-size: 12px; color: var(--muted); }
     h2 { font-size: 18px; font-weight: 600; color: var(--accent); }
 
     .search-bar { display: flex; gap: 10px; margin-bottom: 16px; }
     input[type="text"] {
       flex: 1;
+      min-width: 0;
       background: var(--code-bg);
       border: 1px solid var(--card-border);
       color: var(--text);
@@ -385,6 +390,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     button:hover { background: var(--accent-hover); }
     .btn-secondary { background: transparent; color: var(--text); border: 1px solid var(--card-border); }
     .btn-secondary:hover { background: var(--card-border); }
+    button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 
     .toggle-row { display: flex; align-items: center; gap: 20px; font-size: 13px; color: var(--muted); margin-bottom: 16px; }
     .toggle-row label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
@@ -399,7 +405,49 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       overflow-x: auto;
       color: #e2e8f0;
       margin-bottom: 12px;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      line-height: 1.6;
     }
+
+    #search-results { overflow-x: auto; }
+    .analytics-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 24px; }
+    .analytics-pane { min-width: 0; }
+    .pane-header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 12px; }
+    .pane-header h3, .pane-header label { font-size: 14px; color: var(--text); font-weight: 600; }
+    .btn-compact { padding: 8px 12px; font-size: 12px; }
+    .sql-editor {
+      display: block;
+      width: 100%;
+      min-height: 112px;
+      padding: 14px;
+      resize: vertical;
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      background: var(--code-bg);
+      color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 13px;
+      line-height: 1.6;
+    }
+    .sql-editor:focus { outline: none; border-color: var(--accent); }
+    .result-box {
+      background: var(--code-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 14px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      overflow: auto;
+      max-height: 360px;
+    }
+    #group-results { min-height: 236px; }
+    #sql-results { min-height: 112px; margin-top: 12px; }
+    .api-error { margin-top: 16px; padding: 12px; border: 1px solid #7f3545; border-radius: 8px; color: #fda4af; overflow-wrap: anywhere; }
+    .api-error:empty { display: none; }
 
     table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 12px; }
     th { text-align: left; padding: 10px 12px; background: rgba(255,255,255,0.02); color: var(--muted); border-bottom: 1px solid var(--card-border); }
@@ -420,6 +468,19 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       transition: all 0.2s;
     }
     .drop-zone:hover { border-color: var(--accent); color: var(--text); }
+    @media (max-width: 900px) {
+      .analytics-grid { grid-template-columns: minmax(0, 1fr); }
+      #group-results { min-height: 112px; }
+    }
+    @media (max-width: 640px) {
+      body { padding: 16px; }
+      .section { padding: 16px; }
+      .search-bar { flex-wrap: wrap; }
+      .search-bar input { flex-basis: 220px; }
+      .toggle-row { flex-wrap: wrap; gap: 12px; }
+      .toggle-row label { max-width: 100%; }
+      h2 { font-size: 16px; }
+    }
   </style>
 </head>
 <body>
@@ -429,7 +490,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         <h1>snort</h1>
         <span class="badge">live engine online</span>
       </div>
-      <div>
+      <div class="header-actions">
         <button class="btn-secondary" onclick="sealStore()">seal wal to lance</button>
         <button class="btn-secondary" onclick="runDemo()">load demo sample</button>
       </div>
@@ -506,16 +567,30 @@ curl -X POST http://localhost:8080/ingest \\
         <div id="results-empty" style="color: var(--muted); font-size: 13px; padding: 12px 0;">enter a query to search sealed lance segments and live wal tail.</div>
       </div>
     </div>
-  </div>
-
-  <div class="panel" style="margin: 24px;">
-    <h2>live groups and SQL analytics</h2>
-    <button onclick="loadGroups()">refresh groups</button>
-    <pre id="group-results" style="white-space: pre-wrap;">load groups to inspect memberships and evidence.</pre>
-    <textarea id="sql-input" style="width:100%;min-height:70px;">SELECT host, count(*) AS events FROM events GROUP BY host</textarea>
-    <button onclick="runSql()">run read-only SQL</button>
-    <pre id="sql-results" style="white-space: pre-wrap;"></pre>
-    <div id="api-error" role="alert" style="color:#f88;"></div>
+    <div class="section" id="analytics-section">
+      <div class="section-header">
+        <h2>live groups and SQL analytics</h2>
+        <span class="section-note">inspect memberships and query stored events</span>
+      </div>
+      <div class="analytics-grid">
+        <section class="analytics-pane" aria-labelledby="groups-heading">
+          <div class="pane-header">
+            <h3 id="groups-heading">groups and evidence</h3>
+            <button class="btn-secondary btn-compact" onclick="loadGroups()">refresh groups</button>
+          </div>
+          <pre id="group-results" class="result-box" aria-live="polite">load groups to inspect memberships and evidence.</pre>
+        </section>
+        <section class="analytics-pane" aria-labelledby="sql-heading">
+          <div class="pane-header">
+            <label id="sql-heading" for="sql-input">SQL query</label>
+            <button class="btn-compact" onclick="runSql()">run read-only SQL</button>
+          </div>
+          <textarea id="sql-input" class="sql-editor" spellcheck="false">SELECT host, count(*) AS events FROM events GROUP BY host</textarea>
+          <pre id="sql-results" class="result-box" aria-live="polite">query results will appear here.</pre>
+        </section>
+      </div>
+      <div id="api-error" class="api-error" role="alert"></div>
+    </div>
   </div>
   <script>
     async function api(url, options) {
@@ -535,7 +610,10 @@ curl -X POST http://localhost:8080/ingest \\
     });
     async function loadGroups() {
       document.getElementById('api-error').textContent = '';
-      document.getElementById('group-results').textContent = JSON.stringify(await api('/api/groups'), null, 2);
+      const groups = await api('/api/groups');
+      document.getElementById('group-results').textContent = groups.length
+        ? JSON.stringify(groups, null, 2)
+        : 'no groups yet. ingest telemetry to build traces and supported memberships.';
     }
     async function runSql() {
       document.getElementById('api-error').textContent = '';
@@ -551,7 +629,12 @@ curl -X POST http://localhost:8080/ingest \\
         document.getElementById('stat-wal').textContent = `live wal events: ${d.wal_count || 0}`;
         document.getElementById('stat-disk').textContent = `disk: ${(d.disk_bytes / 1024).toFixed(1)} kb`;
         document.getElementById('stat-path').textContent = d.data_dir || '';
-        document.getElementById('curl-cmd').textContent = `curl -X POST http://${window.location.host}/ingest \\\\n  -H "Content-Type: application/json" \\\\n  -d '{"ts": "${new Date().toISOString()}", "host": "srv-1", "action": "exec", "raw": "powershell -enc 123"}'`;
+        const continuation = ` ${String.fromCharCode(92, 10)}`;
+        document.getElementById('curl-cmd').textContent = [
+          `curl -X POST ${window.location.origin}/ingest`,
+          '  -H "Content-Type: application/json"',
+          `  -d '{"ts": "${new Date().toISOString()}", "host": "srv-1", "action": "exec", "raw": "powershell -enc 123"}'`
+        ].join(continuation);
       } catch (e) {
         document.getElementById('api-error').textContent = e.message;
       }
