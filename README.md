@@ -18,6 +18,41 @@ drop the single binary anywhere and run it. it starts an embedded web dashboard 
 - tamper-evident lineage: blake3 cryptographic hash chains protect every event, segment, and decision ledger.
 - cross-platform releases: standalone binaries for macos, linux, windows, and android.
 
+```mermaid
+---
+config:
+  theme: neutral
+  flowchart:
+    curve: basis
+    nodeSpacing: 30
+    rankSpacing: 38
+---
+flowchart TB
+
+    SRC["Telemetry / Dataset Sources"]
+    Q["Incoming Queries"]
+
+    SRC --> READ["Readers"]
+    READ --> WAL["BLAKE3 WAL"]
+    WAL --> BUF["In-Memory Buffer"]
+
+    Q --> TEXT["Free-text / Keywords"]
+    Q --> SQL["Structured / Analytics"]
+
+    TEXT --> SDK["Lance Native SDK"]
+    SQL --> DUCK["DuckDB"]
+
+    BUF -->|"seal / append"| LANCE["Lance Dataset"]
+    SDK --> LANCE
+    DUCK --> BUF
+    DUCK --> LANCE
+
+    LANCE --> INDEX["Native Indexes
+    BTREE · Full-Text · Vector"]
+
+    classDef focus stroke-width:3px
+    class LANCE focus
+```
 ## quick start
 
 ### 1. start the engine
