@@ -6,8 +6,16 @@ generic JSONL reader. Each reader yields raw mappings; the caller
 normalizes them with :func:`snort.ingest.events.normalize_event`.
 
 Per-source sequence numbers are stamped here when missing (plan
-section 3, ordering): the counter is per ``source_id`` and restarts only
-when the reader restarts, so file tails resume from committed offsets.
+section 3, ordering). The counter is local to a single reader
+invocation and restarts at zero on the next invocation, so it orders
+events *within* a run only.
+
+It is not a resume mechanism: re-reading the same file restamps the
+same sequence numbers. Re-ingestion is made safe downstream instead,
+where :class:`snort.runtime.LiveRuntime` records content and sequence
+identities plus ``source_checkpoints`` and reports repeated events as
+duplicates. Callers that need cross-run ordering should supply
+``source_id``/``source_seq`` or ``event_id`` themselves.
 """
 
 from __future__ import annotations

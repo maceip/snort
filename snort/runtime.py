@@ -147,6 +147,7 @@ class LiveRuntime:
             CREATE TABLE IF NOT EXISTS decisions (seq INTEGER PRIMARY KEY, kind TEXT, record_hash TEXT,
                 prev_hash TEXT, context TEXT, inputs_hash TEXT, model_hash TEXT, params_hash TEXT, output_hash TEXT);
         """)
+        self._trace_cache = {}
         self.restore()
 
     def restore(self):
@@ -206,15 +207,36 @@ class LiveRuntime:
             for kind, values in trace.features.indicators.items()
             for value in values
         )
-        return Trace(
-            trace.trace_id,
-            tuple(meta["tokens"]),
-            frozenset(trace.features.technique_tags),
-            indicators,
-            frozenset(meta["entities"]),
-            trace.start_ts or 0.0,
-            trace.end_ts or 0.0,
+        techniques = frozenset(trace.features.technique_tags)
+        entities = frozenset(meta["entities"])
+        tokens = tuple(meta["tokens"])
+        start_ts = trace.start_ts or 0.0
+        end_ts = trace.end_ts or 0.0
+        # Trace shingles/signature/token_counts are pure functions of these inputs, so
+        # recomputing them for every trace on every ingest call is quadratic. Cache one
+        # version per trace and rebuild only when its inputs actually change.
+        key = (
+            tokens,
+            tuple(sorted(techniques)),
+            tuple(sorted(indicators)),
+            tuple(sorted(entities)),
+            start_ts,
+            end_ts,
         )
+        cached = self._trace_cache.get(trace.trace_id)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        built = Trace(
+            trace.trace_id,
+            tokens,
+            techniques,
+            indicators,
+            entities,
+            start_ts,
+            end_ts,
+        )
+        self._trace_cache[trace.trace_id] = (key, built)
+        return built
 
     def _rebuild_indexes(self):
         self.matching = {}

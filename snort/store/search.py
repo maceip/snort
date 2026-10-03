@@ -271,8 +271,19 @@ def search(
                 f"'{name}' AS _segment, '{source}' AS _source, 'substring' AS _search_mode, 0.5 AS _score FROM '{path}'"
             )
         where = "contains(raw, ?)" + (f" AND ({filter_expr})" if filter_expr else "")
-        sql = f"SELECT {SELECT_RESULT} FROM (SELECT * EXCLUDE(ts), ts AS ts_original, CAST(ts AS TIMESTAMPTZ) AS ts FROM ({' UNION ALL '.join(parts)})) WHERE {where} LIMIT ?"
-        cursor = con.execute(sql, [query, limit])
+        # Expose the union as the `events` CTE so filters resolve against the same
+        # table name _filter_rows validated against; never swallow a predicate failure.
+        union = " UNION ALL ".join(parts)
+        sql = (
+            f"WITH events AS ({union}) "
+            f"SELECT {SELECT_RESULT} FROM ("
+            f"SELECT * EXCLUDE(ts), ts AS ts_original, CAST(ts AS TIMESTAMPTZ) AS ts FROM events"
+            f") WHERE {where} LIMIT ?"
+        )
+        try:
+            cursor = con.execute(sql, [query, limit])
+        except duckdb.Error as exc:
+            raise RequestError(f"invalid filter: {exc}") from exc
         return unranked(
             [
                 dict(zip([d[0] for d in cursor.description], row))

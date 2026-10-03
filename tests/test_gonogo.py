@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 
 import pandas as pd
 
@@ -109,7 +110,9 @@ def test_go1_cli_writes_report(tmp_path):
     import subprocess
 
     out = os.path.join(d, "report.json")
-    p = subprocess.run(["python3", "-m", "lab.eval.gono_go1_boundaries",
+    # Use sys.executable so the subprocess runs the same interpreter (and therefore
+    # the same environment) as the test run; a bare "python3" may resolve elsewhere.
+    p = subprocess.run([sys.executable, "-m", "lab.eval.gono_go1_boundaries",
                         "--events", os.path.join(d, "events.parquet"),
                         "--traces", os.path.join(d, "traces.parquet"),
                         "--manifest", os.path.join(d, "manifest.json"),
