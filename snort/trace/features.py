@@ -8,6 +8,7 @@ Every field merges in O(1) amortized per event / O(num_perm) for the
 sketch, so open traces update incrementally and sealed halves combine
 exactly.
 """
+
 from __future__ import annotations
 
 import math
@@ -19,7 +20,9 @@ from snort.trace.minhash import MinHashSketch
 NUM_PERM = 128
 
 
-def shingles_for_event(tokens: list[str], technique_ids: Iterable[str] = ()) -> list[str]:
+def shingles_for_event(
+    tokens: list[str], technique_ids: Iterable[str] = ()
+) -> list[str]:
     """1-3-gram shingles of the token stream plus technique IDs."""
     shingles: list[str] = []
     n = len(tokens)
@@ -85,6 +88,48 @@ def indicators_for_event(event: Mapping) -> dict[str, set[str]]:
     return out
 
 
+class EdgeTransitionScorer:
+    """Lightweight linear edge transition scoring (PIDSMaker / VELOX)."""
+
+    COMMON_TRANSITIONS = {
+        ("process", "fork", "process"): 0.01,
+        ("process", "exec", "process"): 0.05,
+        ("process", "read", "file"): 0.01,
+        ("process", "write", "file"): 0.02,
+        ("process", "connect", "socket"): 0.05,
+        ("process", "send", "socket"): 0.02,
+        ("process", "recv", "socket"): 0.02,
+    }
+
+    SUSPICIOUS_TRANSITIONS = {
+        ("process", "inject", "process"): 0.95,
+        ("process", "write", "memory"): 0.90,
+        ("process", "modify", "registry"): 0.80,
+        ("process", "connect", "raw_socket"): 0.85,
+        ("process", "unlink", "log"): 0.90,
+    }
+
+    def score_edge(self, subject: str, action: str, obj: str) -> float:
+        s_type = "process"
+        a_type = action.lower()
+        o_type = "file"
+        if any(w in obj.lower() for w in ("sock", ":", "http", "ip")):
+            o_type = "socket"
+        elif any(w in obj.lower() for w in ("proc", "pid")):
+            o_type = "process"
+        elif any(w in obj.lower() for w in ("mem", "shm")):
+            o_type = "memory"
+        elif "reg" in obj.lower():
+            o_type = "registry"
+
+        key = (s_type, a_type, o_type)
+        if key in self.SUSPICIOUS_TRANSITIONS:
+            return self.SUSPICIOUS_TRANSITIONS[key]
+        if key in self.COMMON_TRANSITIONS:
+            return self.COMMON_TRANSITIONS[key]
+        return 0.25
+
+
 class MergeableTraceFeatures:
     """Incrementally updated, exactly mergeable trace summary."""
 
@@ -94,6 +139,8 @@ class MergeableTraceFeatures:
         self.technique_tags: set[str] = set()
         self.indicators: dict[str, set[str]] = {}
         self.event_count: int = 0
+        self.edge_anomaly_score: float = 0.0
+        self.anomalous_edge_count: int = 0
         self.start_ts: float | None = None
         self.end_ts: float | None = None
         self.minhash = MinHashSketch(num_perm=num_perm)
@@ -150,6 +197,14 @@ class MergeableTraceFeatures:
                 self.start_ts = ts
             if self.end_ts is None or ts > self.end_ts:
                 self.end_ts = ts
+        if event is not None and "action" in event:
+            sub = str(event.get("subject", ""))
+            act = str(event.get("action", ""))
+            obj = str(event.get("object", ""))
+            score = EdgeTransitionScorer().score_edge(sub, act, obj)
+            self.edge_anomaly_score += score
+            if score >= 0.7:
+                self.anomalous_edge_count += 1
         self.event_count += 1
         shingles = shingles_for_event(toks, techs)
         if shingles:
@@ -167,6 +222,10 @@ class MergeableTraceFeatures:
         for k, v in other.indicators.items():
             merged.indicators.setdefault(k, set()).update(v)
         merged.event_count = self.event_count + other.event_count
+        merged.edge_anomaly_score = self.edge_anomaly_score + other.edge_anomaly_score
+        merged.anomalous_edge_count = (
+            self.anomalous_edge_count + other.anomalous_edge_count
+        )
         starts = [t for t in (self.start_ts, other.start_ts) if t is not None]
         ends = [t for t in (self.end_ts, other.end_ts) if t is not None]
         merged.start_ts = min(starts) if starts else None
@@ -193,6 +252,8 @@ class MergeableTraceFeatures:
             "technique_tags": sorted(self.technique_tags),
             "indicators": {k: sorted(v) for k, v in self.indicators.items()},
             "event_count": self.event_count,
+            "edge_anomaly_score": round(self.edge_anomaly_score, 3),
+            "anomalous_edge_count": self.anomalous_edge_count,
             "start_ts": self.start_ts,
             "end_ts": self.end_ts,
             "minhash": self.minhash.to_dict(),
@@ -206,6 +267,8 @@ class MergeableTraceFeatures:
         feats.technique_tags = set(d.get("technique_tags", []))
         feats.indicators = {k: set(v) for k, v in d.get("indicators", {}).items()}
         feats.event_count = int(d.get("event_count", 0))
+        feats.edge_anomaly_score = float(d.get("edge_anomaly_score", 0.0))
+        feats.anomalous_edge_count = int(d.get("anomalous_edge_count", 0))
         feats.start_ts = d.get("start_ts")
         feats.end_ts = d.get("end_ts")
         feats.minhash = MinHashSketch.from_dict(d["minhash"])
@@ -231,37 +294,58 @@ import re
 
 # --- Text-similarity primitives for the separability go/no-go test ---
 _TOKEN = re.compile(r"[a-z0-9_]+(?:/[a-z0-9_.:-]+)?")
+
+
 def tokenize(text: str) -> list[str]:
     return _TOKEN.findall((text or "").lower())
+
+
 def shingles(tokens: list[str], ns: tuple[int, ...] = (1, 2, 3)) -> set[str]:
     out: set[str] = set()
     for n in ns:
         for i in range(len(tokens) - n + 1):
             out.add(" ".join(tokens[i : i + n]))
     return out
+
+
 def _perm_hash(shingle: str, perm: int) -> int:
     return int.from_bytes(
         hashlib.sha256(f"{perm}\x00{shingle}".encode("utf-8")).digest()[:8], "big"
     )
+
+
 def minhash_signature(shingle_set: set[str], num_perm: int = NUM_PERM) -> list[int]:
     if not shingle_set:
         return [0] * num_perm
     return [min(_perm_hash(s, p) for s in shingle_set) for p in range(num_perm)]
+
+
 def minhash_jaccard(sig_a: list[int], sig_b: list[int]) -> float:
     agree = sum(1 for a, b in zip(sig_a, sig_b) if a == b)
     return agree / len(sig_a)
+
+
 def trace_signatures(texts: list[str]) -> list[list[int]]:
     return [minhash_signature(shingles(tokenize(t))) for t in texts]
+
+
 def tfidf_cosine(texts: list[str]):
     """Return the dense cosine-similarity matrix for trace texts."""
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.metrics.pairwise import cosine_similarity
-    vec = TfidfVectorizer(token_pattern=r"[a-z0-9_]+(?:/[a-z0-9_.:-]+)?",
-                          ngram_range=(1, 2), sublinear_tf=True)
+
+    vec = TfidfVectorizer(
+        token_pattern=r"[a-z0-9_]+(?:/[a-z0-9_.:-]+)?",
+        ngram_range=(1, 2),
+        sublinear_tf=True,
+    )
     mat = vec.fit_transform(texts)
     return cosine_similarity(mat)
+
+
 def auc(scores: list[float], labels: list[int]) -> float:
     from sklearn.metrics import roc_auc_score
+
     if len(set(labels)) < 2 or not scores:
         return float("nan")
     return float(roc_auc_score(labels, scores))

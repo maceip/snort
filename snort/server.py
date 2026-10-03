@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 import logging
-import os
 from pathlib import Path
 import threading
 import urllib.parse
@@ -14,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from snort.errors import ConflictError, NotFoundError, RequestError
 from snort.ingest.otlp import parse_otlp_logs, parse_otlp_traces
 from snort.ingest.wal import WalWriter
+from snort.persistence import acquire_file_lock
 from snort.store.index import build_index
 from snort.store.seal import seal_segments
 from snort.store.search import search
@@ -46,20 +46,14 @@ class SnortStoreManager:
             self.index_dir = Path(index_dir).resolve()
         self.ledger_file = self.data_dir / "ledger" / "ledger.jsonl"
         self.lock = threading.RLock()
-        self._writer_lock = open(self.data_dir / ".writer.lock", "a+b")
+        self._writer_locks = []
         try:
-            if os.name == "nt":
-                import msvcrt
-
-                self._writer_lock.seek(0)
-                self._writer_lock.write(b"0")
-                self._writer_lock.flush()
-                self._writer_lock.seek(0)
-                msvcrt.locking(self._writer_lock.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(self._writer_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Custom WAL paths may be shared by independent data directories.
+            # Lock both resources before opening or recovering either one.
+            for lock_path in dict.fromkeys((
+                self.data_dir / ".writer.lock", self.wal_dir / ".writer.lock"
+            )):
+                self._writer_locks.append(acquire_file_lock(lock_path))
             for path in (
                 self.wal_dir,
                 self.sealed_dir,
@@ -76,7 +70,8 @@ class SnortStoreManager:
                 self.wal_writer.abort()
             if hasattr(self, "runtime"):
                 self.runtime.close()
-            self._writer_lock.close()
+            for handle in reversed(self._writer_locks):
+                handle.close()
             raise
         self._recover_needed = False
         self._closed = False
@@ -893,7 +888,8 @@ class SnortStoreManager:
                     self.wal_writer.abort()
                     self.runtime.close()
                 finally:
-                    self._writer_lock.close()
+                    for handle in reversed(self._writer_locks):
+                        handle.close()
                     self._closed = True
 
     def __enter__(self):

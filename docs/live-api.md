@@ -61,14 +61,26 @@ identical content is a duplicate; different content is a conflict. When sequence
 numbers are absent, the service assigns them from durable source checkpoints and
 deduplicates identical normalized content. An explicit `event_id` distinguishes
 separate otherwise-identical events. An optional `Idempotency-Key` header binds
-an entire batch to its content, including its size and ordering.
+an entire batch to its content, including its size and ordering. Event IDs are
+checked independently of that batch key: a new key cannot duplicate an existing
+event ID or accept changed content under it. Existing receipt projections are
+upgraded on startup, including event IDs from request-scoped receipts and legacy
+WAL content fingerprints. Retries also recognize the fingerprint format used
+before the newer template/tag/entropy enrichment; the original WAL and event
+hashes are preserved.
 
 New WAL segments are incremental plain JSONL, with flush/fsync per event. Legacy
 compressed segments remain readable. Startup verifies and manifests orphan tails,
 trims incomplete final records, and replays durable events missing from SQLite.
-One process holds the writer lock; another writer cannot open the same store.
+One process holds locks on both the data directory and the resolved WAL directory;
+another writer cannot open either resource, even with a different data directory
+or a symlink to the same WAL.
 Use HTTP sealing/indexing while the server is running; standalone CLI seal/index
 operations also take the writer lock.
+
+Legacy sealed segments written before `flux_tags` was introduced remain readable.
+Search and SQL snapshots project a zero tag mask without rewriting stored events
+or segment hashes.
 
 ## Group scoring and review
 
@@ -86,8 +98,16 @@ so callers must supply representative labels before interpreting probabilities
 as operationally calibrated. The service does not train on hidden demo labels.
 
 A trace has at most three active memberships, including seeded memberships and
-all subsequent assignments. Rejection frees an active slot; confirmation cannot
-exceed the cap. Analyst labels stay trace-group labels. Groups are overlapping;
+all subsequent assignments. Automatic memberships become `unsupported` when
+current evidence falls below the assignment threshold; strength and evidence
+are refreshed, the history remains inspectable, and their active slots are freed.
+Previously supported memberships with scores between 0.5 and 0.8 become proposed.
+Existing stores receive a one-time startup repair from their saved pair evidence;
+the repair is recorded in the ledger and preserves analyst decisions.
+Changed traces invalidate previous pair scores; pairs not rescored within the
+current retrieval/budget cannot retain automatic support. Analyst confirmation
+and rejection remain explicit decisions. Confirmation cannot exceed the active
+cap, including reactivation of an unsupported membership. Groups are overlapping;
 merge proposals do not perform automatic transitive closure.
 
 ## SQL and CLI
@@ -111,7 +131,7 @@ SELECT m.group_id, e.host, count(*) AS events
 FROM events e
 JOIN trace_events t USING (event_hash)
 JOIN memberships m USING (trace_id)
-WHERE m.state <> 'analyst-rejected'
+WHERE m.state NOT IN ('analyst-rejected', 'unsupported')
 GROUP BY m.group_id, e.host;
 ```
 

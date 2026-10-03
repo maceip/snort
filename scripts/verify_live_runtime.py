@@ -49,10 +49,12 @@ def start(path):
     return process, f"http://127.0.0.1:{port}"
 
 
-def request(url, path, data=None, expected=200):
+def request(url, path, data=None, expected=200, headers=None):
     body = json.dumps(data).encode() if data is not None else None
     req = urllib.request.Request(
-        url + path, data=body, headers={"Content-Type": "application/json"}
+        url + path,
+        data=body,
+        headers={"Content-Type": "application/json", **(headers or {})},
     )
     try:
         response = urllib.request.urlopen(req, timeout=30)
@@ -88,7 +90,7 @@ def main():
         process, url = start(temporary)
         try:
             rows = [
-                record(0, "s1"),
+                record(0, "s1", event_id="proof-first"),
                 record(1, "s2"),
                 record(
                     2,
@@ -99,7 +101,23 @@ def main():
                     techniques=[],
                 ),
             ]
+            rows[0].pop(
+                "source_seq"
+            )  # Exercise stable IDs independently of sequencing.
             assert request(url, "/ingest", rows)["ingested"] == 3
+            assert (
+                request(
+                    url, "/ingest", [rows[0]], headers={"Idempotency-Key": "new-batch"}
+                )["duplicates"]
+                == 1
+            )
+            request(
+                url,
+                "/ingest",
+                [dict(rows[0], raw="changed content")],
+                expected=409,
+                headers={"Idempotency-Key": "changed-batch"},
+            )
             assert len(request(url, "/api/search?q=powershell")) == 2
             groups = request(url, "/api/groups")
             assert groups
@@ -125,7 +143,9 @@ def main():
             )
             noise = next(
                 t["trace_id"]
-                for t in request(url, "/api/traces")
+                for t in request(
+                    url, "/api/query", {"sql": "SELECT trace_id,anchor FROM traces"}
+                )
                 if t["anchor"].endswith(":noise")
             )
             model = request(
@@ -158,6 +178,15 @@ def main():
             assert len(request(url, filtered)) == 3
             assert request(url, "/ingest", [tail])["duplicates"] == 1
             assert (
+                request(
+                    url,
+                    "/ingest",
+                    [rows[0]],
+                    headers={"Idempotency-Key": "after-crash"},
+                )["duplicates"]
+                == 1
+            )
+            assert (
                 request(url, f"/api/groups/{gid}")["members"][members[0]]["state"]
                 == "analyst-confirmed"
             )
@@ -183,6 +212,7 @@ def main():
                     "SQL aggregation",
                     "native BM25 filtering",
                     "idempotent retry",
+                    "stable event IDs across request keys and abrupt restart",
                     "sequence conflict",
                     "invalid record errors",
                     "read-only/external-access SQL rejection",

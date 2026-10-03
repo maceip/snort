@@ -94,7 +94,7 @@ jobs:
           if-no-files-found: error
 
   build-apk:
-    name: Build Android APK (snort-android-arm64.apk)
+    name: Build Android Demo APK (snort-android-arm64.apk)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository

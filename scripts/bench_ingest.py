@@ -12,11 +12,13 @@ search, so ingest and query costs are not conflated.
 import argparse
 import json
 import statistics
+import sys
 import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 REPORT_DIR = ROOT / "bench" / "results" / "throughput"
 
 TEMPLATE = (
@@ -42,18 +44,20 @@ def _ingest_run(events, batch_size):
     with TemporaryDirectory() as tmp:
         with SnortStoreManager(Path(tmp) / "store") as store:
             batches = [
-                events[i : i + batch_size]
-                for i in range(0, len(events), batch_size)
+                events[i : i + batch_size] for i in range(0, len(events), batch_size)
             ]
             start = time.perf_counter()
             for batch in batches:
                 store.ingest(batch, source="bench:throughput")
             elapsed = time.perf_counter() - start
             wal_search = _timed(lambda: store.search_events("powershell", limit=10))
-            seal = _timed(lambda: store.seal_and_index())
-            sealed_search = _timed(
-                lambda: store.search_events("powershell", limit=10)
-            )
+            # Sealing mutates the store: later repetitions would measure empty work.
+            seal_start = time.perf_counter()
+            sealed = store.seal_and_index()
+            seal = time.perf_counter() - seal_start
+            if sealed["sealed_count"] != len(events):
+                raise RuntimeError("benchmark did not seal every ingested event")
+            sealed_search = _timed(lambda: store.search_events("powershell", limit=10))
             bm25_search = _timed(
                 lambda: store.search_events("powershell", limit=10, bm25=True)
             )
@@ -68,6 +72,7 @@ def _ingest_run(events, batch_size):
         "ingest_ms_per_event": round(elapsed * 1000 / n, 3) if n else None,
         "wal_search_ms": round(wal_search * 1000, 2),
         "seal_ms": round(seal * 1000, 2),
+        "seal_events": sealed["sealed_count"],
         "sealed_search_ms": round(sealed_search * 1000, 2),
         "sealed_bm25_search_ms": round(bm25_search * 1000, 2),
     }
@@ -116,6 +121,7 @@ def main(argv=None):
         "",
         f"Events per run: {args.events}. Durable append (fsync before acknowledgement).",
         "Search timings are the median of 3 calls.",
+        "Seal timing is one complete seal and index operation on the ingested events.",
         "",
         "| batch size | batches | events/s | ms/event | WAL search ms | seal ms | sealed search ms | BM25 ms |",
         "|---|---|---|---|---|---|---|---|",

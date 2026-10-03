@@ -1,0 +1,210 @@
+================================================================================
+SNORT: TEMPORAL ARCHITECTURE & RESEARCH INTEGRATION BLOCK DIAGRAMS
+================================================================================
+These diagrams preserve a research design sketch for text-mode review.
+Timing, memory, and scaling figures are illustrative targets, not measurements.
+The mmap sidecar, Lance ANN index, loop coalescing, and automatic live attribution
+and causal reconstruction are proposed. Current helpers use keyword tagging,
+in-memory trigrams, exact cosine scans, and lookup-table edge scoring. The live
+caller does not provide reciprocal degrees to the queue. Consult live-api.md and
+research-and-temporal-architecture-review.md for the current source audit.
+
+================================================================================
+STAGE 1: Ingestion & Stream Normalization (t = 0 to 10 ms)
+================================================================================
+
+┌────────────────────────────────────────────────────────────────────────┐
+│                     Heterogeneous Telemetry Stream                     │
+│                (Windows Sysmon, Linux auditd, OTLP, CTA)               │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                 Event Normalization (snort.ingest.events)              │
+│  - Canonical schema: <ts, host, source_id, subject, action, obj, ...>  │
+│  - SCLC Syntax Normalization: <IP>, <FILE_PATH>, <URL>, <HASH>, <REG>  │
+│  - Deterministic BLAKE3 event_hash & template_hash                     │
+└───────────────┬────────────────────────────────────────┬───────────────┘
+                │                                        │
+                ▼                                        ▼
+┌───────────────────────────────┐        ┌───────────────────────────────┐
+│     FluxSieve Aho-Corasick    │        │       CLAD Byte Entropy       │
+│  In-Stream High-Frequency     │        │  Shannon Byte Entropy &       │
+│  Predicates -> 32-bit bitmask │        │  Compression Ratio Deviation  │
+│  (FLUX_TAG_ATTACK, ERROR, ...)│        │  -> In-Stream anomaly_score   │
+└───────────────┬───────────────┘        └───────────────┬───────────────┘
+                │                                        │
+                └───────────────────┬────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                   Append-Only BLAKE3 WAL Buffer                        │
+│  - wal-000001.jsonl, fsynced on commit                                 │
+│  - Cryptographic hash chaining: h_i = BLAKE3(h_{i-1} | event)          │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│             LogLite-Q Query-Aware Trigram Sidecar (qidx)               │
+│  - Memory-mapped character 3-gram postings index                       │
+│  - Exact conjunctive substring query candidate filtering (< 2 ms)      │
+└────────────────────────────────────────────────────────────────────────┘
+
+
+================================================================================
+STAGE 2: Temporal Trace Assembly & Lifecycle (t = 10 ms to Minutes)
+================================================================================
+
+            Incoming Normalized Event for Anchor
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │   Open Trace    │◄──────────────┐
+                    │ (In-memory ASM) │               │
+                    └────────┬────────┘               │
+                             │                        │
+         ┌───────────────────┴───────────────────┐    │ Late out-of-order event
+         │                                       │    │ arrives for sealed anchor:
+         ▼ (idle_gap >= 30m)                     ▼    │ Version bump & re-score
+┌──────────────────┐                   ┌──────────────────┐
+│   Sealed Trace   │                   │ Max Duration     │
+│   (Window :0)    │                   │ Reached (24h)    │
+└────────┬─────────┘                   └────────┬─────────┘
+         │                                      │
+         └───────────────────┬──────────────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │ Emit to Dynamic │
+                    │ Retrieval Stage │
+                    └─────────────────┘
+
+Anchor Strategies:
+  • OTLP Spans:      session_id = trace_id -> session:<host>:<trace_id>
+  • Attacker Shells: session_id = beacon_id -> session:<host>:<session_id>
+  • OS Processes:    root_pid               -> host:<host>:<root_pid>
+  • Edge Transitions:VELOX Linear Scorer    -> edge_anomaly_score
+
+
+================================================================================
+STAGE 3: Cross-Trace Dynamic Retrieval (t = 100 ms to 500 ms)
+================================================================================
+
+┌────────────────────────────────────────────────────────────────────────┐
+│                        Newly Sealed Query Trace                        │
+│              (128-d MinHash Signature + Tokens + IOCs + ANNs)          │
+└───────────────┬──────────────────────────┬──────────────────────┬──────┘
+                │                          │                      │
+                ▼                          ▼                      ▼
+┌──────────────────────────────┐ ┌──────────────────┐ ┌──────────────────┐
+│ DynaHash Banded LSH          │ │ BlockingPy ANN   │ │ Indicator Index  │
+│ - Bands derived from theta   │ │ - Lance Vector   │ │ - Inverted IOCs  │
+│ - BK-Tree Multi-Probe (w<=1) │ │   Feature Store  │ │ - Shared IPs,    │
+│ - Sparse bucket expansion    │ │ - Continuous Sim │ │   Domains, Hashes│
+└───────────────┬──────────────┘ └────────┬─────────┘ └──────────┬───────┘
+                │                          │                      │
+                └──────────────────┬───────┴──────────────────────┘
+                                   │
+                                   ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                        Raw Candidate Union Pool                        │
+└──────────────────────────────────┬─────────────────────────────────────┘
+                                   │
+                                   ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│             Deduplicate, Score Initial Estimates & HARD CAP            │
+│                         (MAX_CANDIDATES <= 50)                         │
+└────────────────────────────────────────────────────────────────────────┘
+
+
+================================================================================
+STAGE 4: Budgeted Progressive Matching & Overlapping Groups (t = 500 ms to 2 s)
+================================================================================
+
+┌────────────────────────────────────────────────────────────────────────┐
+│                       <= 50 Candidate Pairs                            │
+└──────────────────────────────────┬─────────────────────────────────────┘
+                                   │
+                                   ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                 BestFirstQueue (Maciejewski et al. PER)                │
+│                                                                        │
+│                               SimilarityEstimate(u, v)                 │
+│              Priority(u, v) = ────────────────────────                 │
+│                                  √(deg(u) · deg(v))                    │
+│                                                                        │
+│   * Rare security anomalies jump ahead of noisy high-degree daemons    │
+└──────────────────────────────────┬─────────────────────────────────────┘
+                                   │
+                                   ▼ (Popped within CPU comparison budget)
+┌────────────────────────────────────────────────────────────────────────┐
+│             Calibrated Logistic Model (snort.match.pair_model)         │
+│           Evaluates 12 pairwise features -> Outputs P(same-group)      │
+└──────────────────────────────────┬─────────────────────────────────────┘
+                                   │
+                 ┌─────────────────┴─────────────────┐
+                 │                                   │
+                 ▼ (P >= 0.80 & 2 evidence classes)  ▼ (P < 0.80)
+┌─────────────────────────────────┐ ┌────────────────────────────────────┐
+│ Incident Grouping (snort.group) │ │ Defer / Drop Link                  │
+│ - Soft, Overlapping Groups      │ │ Trace remains unassigned singleton │
+│ - MAX 3 memberships per trace   │ └────────────────────────────────────┘
+│ - STRICT RULE: No Transitive    │
+│   Closure (no mega-cluster!)    │
+└─────────────────────────────────┘
+
+
+================================================================================
+STAGE 5: Attribution, Forensics & Lineage (t = 2 s to 10 s)
+================================================================================
+
+┌────────────────────────────────────────────────────────────────────────┐
+│                         Incident Group Formed                          │
+│               (Traces A, B, C across Host 1 and Host 2)                │
+└───────────────┬──────────────────────────┬──────────────────────┬──────┘
+                │                          │                      │
+                ▼                          ▼                      ▼
+┌──────────────────────────────┐ ┌──────────────────┐ ┌──────────────────┐
+│ Behavioral Attribution       │ │ Causal DAG       │ │ BLAKE3 Decision  │
+│ (Unveiling-CTAs Fusion)      │ │ Reconstruction   │ │ Ledger (Audit)   │
+│ - SCLC Command Syntax TF-IDF │ │ (PIDSMaker /     │ │ - Tamper-evident │
+│ - ATT&CK Profile Blending    │ │  DepImpact)      │ │   hash chain     │
+│ - Explicit 'unresolved'      │ │ - Multi-window   │ │ - Immutable      │
+│   unknown class for open-set │ │   backward slice │ │   record lineage │
+└───────────────┬──────────────┘ └────────┬─────────┘ └──────────┬───────┘
+                │                          │                      │
+                ▼                          ▼                      ▼
+┌──────────────────────────────┐ ┌──────────────────┐ ┌──────────────────┐
+│ Analyst Output:              │ │ Analyst Output:  │ │ Analyst Output:  │
+│ Threat Actor Probability     │ │ Root-cause to    │ │ Cryptographically│
+│ Ranking OR 'unresolved'      │ │ impact causality │ │ verified log     │
+└──────────────────────────────┘ └──────────────────┘ └──────────────────┘
+
+
+================================================================================
+STAGE 6: Memory & Long-Term Retention Over Time
+================================================================================
+
+┌────────────────────────────────────────────────────────────────────────┐
+│                      Continuous Ingest Telemetry                       │
+└──────────────────────────────────┬─────────────────────────────────────┘
+                                   │
+                                   ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│           In-Memory WAL Buffer (wal-*.jsonl, fsynced on write)         │
+└──────────────────────────────────┬─────────────────────────────────────┘
+                                   │ (Segment threshold: 50k events / 1 hr)
+                                   ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│           snort.store.seal (Sealed Columnar Lance Datasets)            │
+│   - Stores flux_tags as pa.int64()                                     │
+│   - sealed-manifest.json cryptographic hash chain                      │
+└──────────────────────────────────┬─────────────────────────────────────┘
+                                   │
+                                   ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│          DuckDB Query Engine with Bitwise FluxSieve Pushdown           │
+│   - Zero-copy scanning of sealed Lance partitions                      │
+│   - Bitwise mask filtering: WHERE ((flux_tags & {mask}) != 0)          │
+│   - Sub-second queries across millions of historical events            │
+└────────────────────────────────────────────────────────────────────────┘

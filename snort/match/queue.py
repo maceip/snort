@@ -8,7 +8,9 @@ sequence features and flagged as degraded.
 
 from __future__ import annotations
 
+import collections
 import heapq
+import math
 import time
 from dataclasses import dataclass, field
 
@@ -22,10 +24,11 @@ SEQ_IDX = tuple(i for i, n in enumerate(FEATURE_NAMES) if n in SEQ_FEATURES)
 
 @dataclass(order=True)
 class _Queued:
-    neg_estimate: float
+    neg_priority: float
     seq: int
     trace_id: str = field(compare=False)
     candidate_id: str = field(compare=False)
+    estimate: float = field(compare=False)
     cost: float = field(compare=False)
 
 
@@ -39,29 +42,53 @@ class ScoredPair:
 
 
 class BestFirstQueue:
-    """Max-estimate-first queue with a per-round cost budget."""
+    """Max-estimate-first queue with a per-round cost budget and PER reciprocal degree anti-hub weighting."""
 
-    def __init__(self, budget_per_round: float = 20_000.0) -> None:
+    def __init__(
+        self, budget_per_round: float = 20_000.0, reciprocal_degree: bool = True
+    ) -> None:
         self.budget_per_round = budget_per_round
+        self.reciprocal_degree = reciprocal_degree
         self._heap: list[_Queued] = []
         self._seq = 0
+        self._degree: dict[str, int] = collections.defaultdict(int)
 
     def __len__(self) -> int:
         return len(self._heap)
 
     def push(
-        self, trace_id: str, candidate_id: str, estimate: float, cost: float = 1.0
+        self,
+        trace_id: str,
+        candidate_id: str,
+        estimate: float,
+        cost: float = 1.0,
+        deg_u: int | None = None,
+        deg_v: int | None = None,
     ) -> None:
         if cost <= 0:
             raise ValueError("cost must be positive")
+        self._degree[trace_id] += 1
+        self._degree[candidate_id] += 1
+        # PER: Reciprocal degree node weighting to dampen noisy hub nodes when degrees are provided
+        if (
+            self.reciprocal_degree
+            and deg_u is not None
+            and deg_v is not None
+            and deg_u > 0
+            and deg_v > 0
+        ):
+            priority = estimate / math.sqrt(deg_u * deg_v)
+        else:
+            priority = estimate
+
         heapq.heappush(
             self._heap,
-            _Queued(-estimate, self._seq, trace_id, candidate_id, cost),
+            _Queued(-priority, self._seq, trace_id, candidate_id, estimate, cost),
         )
         self._seq += 1
 
     def pop_round(self) -> list[tuple[str, str, float]]:
-        """Pop highest-estimate-first items fitting this round's budget."""
+        """Pop highest-priority-first items fitting this round's budget."""
         out: list[tuple[str, str, float]] = []
         spent = 0.0
         # A single pair larger than the whole budget still makes progress:
@@ -70,7 +97,7 @@ class BestFirstQueue:
             spent + self._heap[0].cost <= self.budget_per_round or not out
         ):
             item = heapq.heappop(self._heap)
-            out.append((item.trace_id, item.candidate_id, -item.neg_estimate))
+            out.append((item.trace_id, item.candidate_id, item.estimate))
             spent += item.cost
         return out
 
@@ -118,4 +145,6 @@ def build_jobs(
     """Order candidate jobs best-first: highest estimated similarity first."""
     by_id = {c.trace_id: c for c in candidates}
     order = sorted(features_of, key=lambda tid: estimates.get(tid, 0.0), reverse=True)
-    return [(trace, by_id[tid], features_of[tid], estimates.get(tid, 0.0)) for tid in order]
+    return [
+        (trace, by_id[tid], features_of[tid], estimates.get(tid, 0.0)) for tid in order
+    ]

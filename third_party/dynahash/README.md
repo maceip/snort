@@ -22,6 +22,9 @@ in `original/` and are used only by the differential regression tests.
 4. **Streaming multi-probe** — `add` inserts new bucket keys into the
    BK-trees (`bktree.BKTree.insert`), so `probe_get` sees post-`finalize`
    records. `finalize()` rebuilds from current keys and is idempotent.
+   Tree insertion and lookup use iterative traversal to support deep trees.
+   The live `snort.retrieve.minhash_lsh` adapter compacts expired bucket keys
+   so its probe trees remain bounded alongside the signature store.
 5. **Token-set input** — MinHash over caller token strings (trace shingles
    in stage 3). `eps` now sizes `m` (still 116 at the default 0.1); `q`
    remains the default width of the `*_text` helpers, which bridge raw
@@ -29,6 +32,7 @@ in `original/` and are used only by the differential regression tests.
 6. **Packaging** — `mmh3`/`numpy` pinned in `third_party/requirements.txt`;
    the RocksDB binding is imported lazily under its real PyPI name
    (`rocksdb-py`, module `rocksdbpy`) with a helpful error when absent.
+   `third_party.dynahash` is included in the snort wheel for live BK-tree imports.
 
 In-memory bucket key format is unchanged, so token sets built from
 character 2-grams give bit-identical vectors to upstream for the same

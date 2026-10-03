@@ -20,7 +20,10 @@ from snort.store.index import indexed_segments
 
 BOUNDARY_RE = re.compile(r"[\s:;,=()\[\]{}\"']+")
 EVENT_SCHEMA = pa.schema(
-    [(c, pa.int64() if c == "source_seq" else pa.string()) for c in EVENT_COLUMNS]
+    [
+        (c, pa.int64() if c in ("source_seq", "flux_tags") else pa.string())
+        for c in EVENT_COLUMNS
+    ]
 )
 RESULT_SCHEMA = pa.schema(
     list(EVENT_SCHEMA)
@@ -129,7 +132,9 @@ def _collect_wal_records(wal_dir, sealed_wal_names, query_str=None):
     return records
 
 
-def _filter_rows(records, filter_expr=None, query=None, limit=1000):
+def _filter_rows(records, filter_expr=None, query=None, limit=1000, flux_filter=None):
+    # Legacy rows predate event tagging; project a zero mask without rewriting them.
+    records = [dict(r, flux_tags=r.get("flux_tags") or 0) for r in records]
     with _readonly_con() as con:
         con.register("events", pa.Table.from_pylist(records, schema=RESULT_SCHEMA))
         clauses, params = [], []
@@ -138,6 +143,8 @@ def _filter_rows(records, filter_expr=None, query=None, limit=1000):
             params.append(query)
         if filter_expr:
             clauses.append(f"({filter_expr})")
+        if flux_filter is not None:
+            clauses.append(f"((flux_tags & {int(flux_filter)}) != 0)")
         sql = (
             f"SELECT {SELECT_RESULT} FROM (SELECT * EXCLUDE(ts), ts AS ts_original, CAST(ts AS TIMESTAMPTZ) AS ts FROM events)"
             + (" WHERE " + " AND ".join(clauses) if clauses else "")
@@ -158,7 +165,14 @@ def _filter_rows(records, filter_expr=None, query=None, limit=1000):
 
 
 def search_bm25(
-    query, sealed_dir, index_dir=None, wal_dir=None, filter_expr=None, *, limit=1000
+    query,
+    sealed_dir,
+    index_dir=None,
+    wal_dir=None,
+    filter_expr=None,
+    flux_filter=None,
+    *,
+    limit=1000,
 ):
     return search(
         query,
@@ -166,6 +180,7 @@ def search_bm25(
         index_dir,
         wal_dir,
         filter_expr=filter_expr,
+        flux_filter=flux_filter,
         limit=limit,
         bm25=True,
     )
@@ -180,12 +195,13 @@ def search(
     limit=1000,
     bm25=False,
     filter_expr=None,
+    flux_filter=None,
 ):
     split_query(query)
     if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 10000:
         raise RequestError("limit must be between 1 and 10000")
     # Validate even on empty stores and never reinterpret malformed filters as no matches.
-    _filter_rows([], filter_expr)
+    _filter_rows([], filter_expr, flux_filter=flux_filter)
     query = query.strip()
     sealed_dir = Path(sealed_dir)
     sealed = _sealed_entries(sealed_dir)
@@ -205,7 +221,10 @@ def search(
                 for row in table.to_pylist():
                     results.append(
                         dict(
-                            {c: row[c] for c in EVENT_COLUMNS},
+                            {
+                                c: row.get(c, 0) if c == "flux_tags" else row[c]
+                                for c in EVENT_COLUMNS
+                            },
                             _row=int(row["_rowid"]),
                             _segment=seg["name"],
                             _source="index",
@@ -227,12 +246,18 @@ def search(
                             )
                         )
         results.extend(r for r in wal_records if query in r["raw"])
-        filtered = _filter_rows(results, filter_expr, limit=max(len(results), 1))
+        filtered = _filter_rows(
+            results, filter_expr, limit=max(len(results), 1), flux_filter=flux_filter
+        )
         filtered.sort(key=lambda r: (-r["_score"], r["event_hash"]))
         return filtered[:limit]
 
     if not sealed:
-        return unranked(_filter_rows(wal_records, filter_expr, query, limit))
+        return unranked(
+            _filter_rows(
+                wal_records, filter_expr, query, limit, flux_filter=flux_filter
+            )
+        )
     # Keep the Lance/DuckDB unified scan; do not silently drop failed segments or predicates.
     try:
         con = _duckdb_con()
@@ -256,7 +281,9 @@ def search(
                 )
                 for i, event in enumerate(ds.to_table().to_pylist())
             )
-        return unranked(_filter_rows(records, filter_expr, query, limit))
+        return unranked(
+            _filter_rows(records, filter_expr, query, limit, flux_filter=flux_filter)
+        )
     with con:
         con.register(
             "wal_buffer", pa.Table.from_pylist(wal_records, schema=RESULT_SCHEMA)
@@ -266,11 +293,18 @@ def search(
             path = str(sealed_dir / seg["name"]).replace("'", "''")
             name = seg["name"].replace("'", "''")
             source = "index" if seg["name"] in indexed else "scan"
+            schema = lance.dataset(str(sealed_dir / seg["name"])).schema
+            columns = [
+                "0 AS flux_tags" if c == "flux_tags" and c not in schema.names else c
+                for c in EVENT_COLUMNS
+            ]
             parts.append(
-                f"SELECT {', '.join(EVENT_COLUMNS)}, row_number() OVER () - 1 AS _row, "
+                f"SELECT {', '.join(columns)}, row_number() OVER () - 1 AS _row, "
                 f"'{name}' AS _segment, '{source}' AS _source, 'substring' AS _search_mode, 0.5 AS _score FROM '{path}'"
             )
         where = "contains(raw, ?)" + (f" AND ({filter_expr})" if filter_expr else "")
+        if flux_filter is not None:
+            where += f" AND ((flux_tags & {int(flux_filter)}) != 0)"
         # Expose the union as the `events` CTE so filters resolve against the same
         # table name _filter_rows validated against; never swallow a predicate failure.
         union = " UNION ALL ".join(parts)

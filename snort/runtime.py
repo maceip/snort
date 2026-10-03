@@ -18,7 +18,13 @@ import pyarrow as pa
 
 from snort.group import Group, GroupManager, Membership, ScoredLink
 from snort.errors import ConflictError, NotFoundError, RequestError
-from snort.ingest.events import canonical_bytes, event_hash, hash_bytes, normalize_event
+from snort.ingest.events import (
+    canonical_bytes,
+    event_hash,
+    hash_bytes,
+    normalize_event,
+    template_hash,
+)
 from snort.ingest.wal import WalReader
 from snort.ledger.chain import Ledger, LedgerRecord
 from snort.match.features import PairFeatureContext, pair_cost, pair_features
@@ -39,6 +45,7 @@ def snapshot_tables(db):
     events = [json.loads(r[0]) for r in db.execute("SELECT event_json FROM receipts")]
     for event in events:
         event["ts"] = datetime.fromisoformat(event["ts"].replace("Z", "+00:00"))
+        event.setdefault("flux_tags", 0)
     schema = pa.schema(
         [
             pa.field(f.name, pa.timestamp("us", tz="UTC") if f.name == "ts" else f.type)
@@ -78,6 +85,42 @@ def snapshot_tables(db):
 
 def parsed_attributes(event: dict) -> dict:
     return json.loads(event.get("attributes", "{}"))
+
+
+def content_fingerprint(event: dict) -> str:
+    """Hash normalized content independently of sequencing and receipt metadata."""
+    content = {
+        k: v
+        for k, v in event.items()
+        if k not in ("event_hash", "ingest_ts", "source_seq")
+    }
+    attributes = parsed_attributes(event)
+    attributes.pop("_snort_ingest", None)
+    content["attributes"] = canonical_bytes(attributes).decode()
+    return hash_bytes(canonical_bytes(content))
+
+
+def legacy_content_fingerprint(raw: dict, normalized: dict) -> str:
+    """Match receipts written before SCLC/Flux/entropy enrichment was added."""
+    legacy = dict(normalized)
+    legacy.pop("flux_tags", None)
+    attributes = parsed_attributes(normalized)
+    original_attributes = raw.get("attributes") or {}
+    for key in ("flux_tags", "anomaly_score", "byte_entropy", "compression_ratio"):
+        if key in original_attributes:
+            attributes[key] = original_attributes[key]
+        else:
+            attributes.pop(key, None)
+    legacy["attributes"] = canonical_bytes(attributes).decode()
+    obj = raw.get("object", "")
+    object_class = raw.get("object_class", "")
+    if not object_class and isinstance(obj, str):
+        object_class = obj.split(":")[0] if ":" in obj else "entity"
+    template = str(raw.get("template", raw.get("raw", f"{raw.get('action')} {obj}")))
+    legacy["template_hash"] = template_hash(
+        str(raw["action"]), str(object_class), template
+    )
+    return content_fingerprint(legacy)
 
 
 def adapt_event(event: dict) -> dict:
@@ -138,6 +181,10 @@ class LiveRuntime:
             CREATE INDEX IF NOT EXISTS source_identity ON receipts(source_id, source_seq);
             CREATE TABLE IF NOT EXISTS source_checkpoints (source_id TEXT PRIMARY KEY, max_seq INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS request_receipts (request_id TEXT PRIMARY KEY, content_hash TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS event_identities (source_id TEXT NOT NULL, event_id TEXT NOT NULL,
+                event_hash TEXT NOT NULL, content_hash TEXT NOT NULL,
+                PRIMARY KEY(source_id,event_id,event_hash));
+            CREATE TABLE IF NOT EXISTS runtime_migrations (name TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS traces (trace_id TEXT PRIMARY KEY, anchor TEXT, start_ts DOUBLE,
                 end_ts DOUBLE, event_count INTEGER, state TEXT, version INTEGER, features TEXT);
             CREATE TABLE IF NOT EXISTS groups (group_id TEXT PRIMARY KEY, version INTEGER, member_count INTEGER);
@@ -147,8 +194,43 @@ class LiveRuntime:
             CREATE TABLE IF NOT EXISTS decisions (seq INTEGER PRIMARY KEY, kind TEXT, record_hash TEXT,
                 prev_hash TEXT, context TEXT, inputs_hash TEXT, model_hash TEXT, params_hash TEXT, output_hash TEXT);
         """)
+        self._upgrade_receipts()
         self._trace_cache = {}
         self.restore()
+        self._upgrade_membership_support()
+
+    def _record_event_identity(self, event, fingerprint):
+        event_id = parsed_attributes(event).get("event_id")
+        if event_id is not None:
+            self.db.execute(
+                "INSERT OR IGNORE INTO event_identities VALUES (?,?,?,?)",
+                (event["source_id"], str(event_id), event["event_hash"], fingerprint),
+            )
+
+    def _upgrade_receipts(self):
+        """Backfill stable IDs and repair already-projected legacy fingerprints."""
+        migration = "independent-event-identities-v1"
+        if self.db.execute(
+            "SELECT 1 FROM runtime_migrations WHERE name=?", (migration,)
+        ).fetchone():
+            return
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            for event_hash_, event_json in self.db.execute(
+                "SELECT event_hash,event_json FROM receipts"
+            ):
+                event = json.loads(event_json)
+                fingerprint = content_fingerprint(event)
+                self.db.execute(
+                    "UPDATE receipts SET content_hash=? WHERE event_hash=?",
+                    (fingerprint, event_hash_),
+                )
+                self._record_event_identity(event, fingerprint)
+            self.db.execute("INSERT INTO runtime_migrations VALUES (?)", (migration,))
+            self.db.execute("COMMIT")
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
 
     def restore(self):
         saved = self.db.execute("SELECT payload FROM state WHERE id=1").fetchone()
@@ -195,6 +277,45 @@ class LiveRuntime:
             )
             self.model._fitted = True
         self._rebuild_indexes()
+
+    def _upgrade_membership_support(self):
+        """Repair saved automatic memberships using their current pair evidence."""
+        migration = "current-membership-support-v1"
+        if self.db.execute(
+            "SELECT 1 FROM runtime_migrations WHERE name=?", (migration,)
+        ).fetchone():
+            return
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            tids = sorted({t for g in self.groups.groups.values() for t in g.members})
+            for tid in tids:
+                links = self._membership_links(tid)
+                self.groups.assign(
+                    tid,
+                    {
+                        gid: evidence
+                        for gid, evidence in links.items()
+                        if tid in self.groups.groups[gid].members
+                    },
+                )
+            if tids:
+                self.ledger.append(
+                    "membership-support-upgrade",
+                    tids,
+                    {"mode": self.scoring_mode},
+                    {
+                        "assignment": self.groups.tau_m,
+                        "supported": self.groups.tau_seed,
+                    },
+                    {},
+                    [asdict(g) for g in self.groups.groups.values()],
+                )
+                self.persist()
+            self.db.execute("INSERT INTO runtime_migrations VALUES (?)", (migration,))
+            self.db.execute("COMMIT")
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
 
     @property
     def scoring_mode(self):
@@ -267,7 +388,8 @@ class LiveRuntime:
                 raise ConflictError(
                     "Idempotency-Key was already used for a different batch"
                 )
-        prepared, pending, next_seq, duplicates = [], {}, {}, 0
+        prepared, duplicates = [], 0
+        pending, pending_ids, pending_sequences, next_seq = {}, {}, {}, {}
         for index, raw in enumerate(records):
             if not isinstance(raw, dict):
                 raise ValueError(f"record {index}: expected an object")
@@ -280,15 +402,50 @@ class LiveRuntime:
             explicit_seq = "source_seq" in raw
             normalized = normalize_event(raw)
             adapt_event(normalized)  # validate the downstream schema before any write
-            content = {
-                k: v
-                for k, v in normalized.items()
-                if k not in ("event_hash", "ingest_ts", "source_seq")
+            content_hash = content_fingerprint(normalized)
+            compatible_hashes = {
+                content_hash,
+                legacy_content_fingerprint(raw, normalized),
             }
-            content_hash = hash_bytes(canonical_bytes(content))
-            event_id = raw.get(
-                "event_id", attrs.get("event_id") if isinstance(attrs, dict) else None
-            )
+            if explicit_seq:
+                occupied = self.db.execute(
+                    "SELECT content_hash FROM receipts WHERE source_id=? AND source_seq=?",
+                    (source, normalized["source_seq"]),
+                ).fetchone()
+                if occupied and occupied[0] not in compatible_hashes:
+                    raise ConflictError(
+                        f"record {index}: source sequence conflicts with existing content"
+                    )
+                prior_sequence = pending_sequences.get(
+                    (source, normalized["source_seq"])
+                )
+                if prior_sequence is not None:
+                    if prior_sequence != content_hash:
+                        raise ConflictError(
+                            f"record {index}: source sequence conflicts within this batch"
+                        )
+                    duplicates += 1
+                    continue
+            event_id = parsed_attributes(normalized).get("event_id")
+            event_identity = (source, str(event_id)) if event_id is not None else None
+            # Batch keys govern batch retries; they never supersede event identity.
+            if event_identity is not None:
+                fingerprints = {
+                    row[0]
+                    for row in self.db.execute(
+                        "SELECT content_hash FROM event_identities WHERE source_id=? AND event_id=?",
+                        event_identity,
+                    )
+                }
+                if event_identity in pending_ids:
+                    fingerprints.add(pending_ids[event_identity])
+                if fingerprints:
+                    if not fingerprints <= compatible_hashes:
+                        raise ConflictError(
+                            f"record {index}: event ID was already used for different content"
+                        )
+                    duplicates += 1
+                    continue
             if request_key:
                 identity = f"request:{source}:{request_key}:{index}"
             elif event_id is not None:
@@ -302,7 +459,7 @@ class LiveRuntime:
             ).fetchone()
             prior = old[0] if old else pending.get(identity)
             if prior is not None:
-                if prior != content_hash:
+                if prior not in compatible_hashes:
                     raise ConflictError(
                         f"record {index}: identity was already used for different content"
                     )
@@ -326,15 +483,13 @@ class LiveRuntime:
                 (source, seq),
             ).fetchone()
             if occupied:
-                if occupied[0] != content_hash:
+                if occupied[0] not in compatible_hashes:
                     raise ConflictError(
                         f"record {index}: source sequence conflicts with existing content"
                     )
                 duplicates += 1
                 continue
-            if any(
-                e["source_id"] == source and e["source_seq"] == seq for e in prepared
-            ):
+            if (source, seq) in pending_sequences:
                 raise ConflictError(
                     f"record {index}: source sequence appears twice in this batch"
                 )
@@ -351,6 +506,9 @@ class LiveRuntime:
             normalized["attributes"] = canonical_bytes(event_attrs).decode()
             normalized["event_hash"] = event_hash(normalized)
             pending[identity] = content_hash
+            pending_sequences[(source, seq)] = content_hash
+            if event_identity is not None:
+                pending_ids[event_identity] = content_hash
             prepared.append(normalized)
         return prepared, duplicates
 
@@ -381,7 +539,7 @@ class LiveRuntime:
                     "_snort_ingest",
                     {
                         "key": "legacy:" + event["event_hash"],
-                        "content_hash": event["event_hash"],
+                        "content_hash": content_fingerprint(event),
                     },
                 )
                 if receipt.get("request_id"):
@@ -400,6 +558,7 @@ class LiveRuntime:
                         json.dumps(event),
                     ),
                 )
+                self._record_event_identity(event, content_fingerprint(event))
                 self.db.execute(
                     "INSERT INTO source_checkpoints VALUES (?,?) ON CONFLICT(source_id) DO UPDATE SET max_seq=MAX(max_seq,excluded.max_seq)",
                     (event["source_id"], event["source_seq"]),
@@ -449,6 +608,13 @@ class LiveRuntime:
 
     def _group_trace(self, tid):
         trace, context = self.matching[tid], self._context()
+        touched = {tid}
+        # A changed trace or model invalidates prior scores. Unscored pairs
+        # outside the current retrieval/budget cannot keep automatic support.
+        for key in list(self.links):
+            if tid in key:
+                touched.update(key)
+                del self.links[key]
         candidates = self.retriever.retrieve(trace)
         queue = BestFirstQueue()
         for candidate in candidates:
@@ -459,7 +625,6 @@ class LiveRuntime:
                 pair_cost(trace, self.matching[candidate.trace_id]),
             )
         jobs = queue.pop_round()
-        touched = {tid}
         for _, other_id, estimate in jobs:
             other = self.matching[other_id]
             feats = pair_features(trace, other, context)
@@ -521,28 +686,7 @@ class LiveRuntime:
                 link,
             )
         for touched_id in sorted(touched):
-            links_by_group = {}
-            for gid, group in self.groups.groups.items():
-                links = []
-                for member_id, member in group.members.items():
-                    if member_id == touched_id or member.state == "analyst-rejected":
-                        continue
-                    link = self.links.get(tuple(sorted((touched_id, member_id))))
-                    if link:
-                        links.append(
-                            ScoredLink(
-                                member_id,
-                                link["score"],
-                                tuple(link["evidence_classes"]),
-                                link["contributions"],
-                                tuple(link["shared_shingles"]),
-                                tuple(link["shared_indicators"]),
-                                tuple(link["event_hashes"]),
-                            )
-                        )
-                if links:
-                    links_by_group[gid] = links
-            self.groups.assign(touched_id, links_by_group)
+            self.groups.assign(touched_id, self._membership_links(touched_id))
         self.ledger.append(
             "groups",
             sorted(touched),
@@ -551,6 +695,34 @@ class LiveRuntime:
             {},
             {t: self.groups.groups_of(t) for t in sorted(touched)},
         )
+
+    def _membership_links(self, tid):
+        links_by_group = {}
+        for gid, group in self.groups.groups.items():
+            links = []
+            for member_id, member in group.members.items():
+                if (
+                    member_id == tid
+                    or member.state == "analyst-rejected"
+                    or (not member.active and tid not in group.members)
+                ):
+                    continue
+                link = self.links.get(tuple(sorted((tid, member_id))))
+                if link:
+                    links.append(
+                        ScoredLink(
+                            member_id,
+                            link["score"],
+                            tuple(link["evidence_classes"]),
+                            link["contributions"],
+                            tuple(link["shared_shingles"]),
+                            tuple(link["shared_indicators"]),
+                            tuple(link["event_hashes"]),
+                        )
+                    )
+            if links or tid in group.members:
+                links_by_group[gid] = links
+        return links_by_group
 
     def persist(self):
         state = {
@@ -590,7 +762,7 @@ class LiveRuntime:
                 [(trace.trace_id, h) for h in trace.member_event_hashes],
             )
         for group in self.groups.groups.values():
-            count = sum(m.state != "analyst-rejected" for m in group.members.values())
+            count = sum(m.active for m in group.members.values())
             self.db.execute(
                 "INSERT INTO groups VALUES (?,?,?)",
                 (group.group_id, group.version, count),

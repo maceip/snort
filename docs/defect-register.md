@@ -30,13 +30,42 @@ BM25 host-filter bypass in its own "initial evidence" section.
 | D12 | L | Documentation drift | **Fixed** — CLI/README by `3fe84b5`; reader docstring in this pass |
 | D13 | M | Per-ingest cost grows with total traces (quadratic single-event ingest) | **Mitigated** in this pass; residual remains |
 
-Current state: **93 passed, 0 failed** (`.venv/bin/python -m pytest -q --basetemp=<fresh>`),
+Verification snapshot on 2026-10-02: **93 passed, 0 failed** (`.venv/bin/python -m pytest -q --basetemp=<fresh>`),
 and `scripts/verify_live_runtime.py` reports `ok: true` across ingest, grouping, SQL,
 BM25 filtering, idempotent retry, sequence conflict, read-only SQL rejection, checkpoint
 recovery, and ledger verification across an abrupt `SIGKILL` restart.
 
 > Sandbox note: `tmp_path` fixtures fail with `PermissionError: EEXIST` on
 > `pytest-of-unknown` in this environment. Run pytest with `--basetemp=/tmp/<fresh-dir>`.
+
+## Review fixes on 2026-10-03
+
+- Lock both the data directory and resolved WAL directory before recovery.
+- Check stable event IDs independently of request keys, including old receipts.
+- Refresh automatic group support, retaining inactive history and analyst labels;
+  repair stale saved memberships once on startup with a ledger record.
+- Use consistent legacy receipt fingerprints and accept identical retries of
+  events normalized at `6bad1a8`, without rewriting their acknowledged hashes.
+- Time one complete seal/index operation and verify its event count.
+- Label the APK `Snort Demo` (`com.snort.demo`), remove stub native code and
+  generated padding, and state that the UI contains no analysis engine.
+
+Validation: **28 tests passed** in the current reorganized suite, including 17
+new regression cases. The live HTTP proof passed event-ID retries across request
+keys and an abrupt SIGKILL/restart. The rebuilt APK passed signature verification,
+installation, launch, and visual inspection on an Android emulator.
+
+Commit preparation also preserved the existing event-enrichment, retrieval,
+edge-scoring, trigram-helper, research-note, and subsystem-test changes. Inspection
+found and fixed missing wheel packaging for the BK-tree, recursion and expired-key
+growth in probe trees, and searches of legacy sealed datasets without `flux_tags`.
+Optional queue weighting now honors its switch, dense retrieval uses trace duration,
+and the entropy fixture is deterministic. Research diagrams distinguish proposed
+wiring from live service behavior.
+
+Final local validation: **34 pytest cases and 23 DynaHash regressions passed**;
+HTTP crash/restart, the full CLI demo and ledger verification, blob ingest/search,
+and ingest/search/ledger checks from an isolated wheel all passed.
 
 ---
 
@@ -116,12 +145,18 @@ a directory file lock guards multi-process access; ingest/seal/query are seriali
 seal, sealed search, and BM25 search across batch sizes, and writes
 `bench/results/throughput/report.{json,md}`.
 
-Measured on this machine, synthetic events, local filesystem:
+Historical measurements on this machine, synthetic events, local filesystem:
 
 | batch size | events | events/s | ms/event | WAL search ms | seal ms | sealed search ms | BM25 ms |
 |---|---|---|---|---|---|---|---|
 | 100 | 1500 | 174.2 | 5.74 | 16.1 | 13.4 | 74.9 | 29.9 |
 | 500 | 1500 | 411.8 | 2.43 | 17.3 | 12.6 | 67.5 | 29.0 |
+
+**Sealing correction (2026-10-03):** the historical `seal ms` values above are
+invalid: the median covered one full seal and two empty operations. The benchmark
+now times one complete seal/index operation, reports `seal_events`, and rejects
+runs that do not seal every input event. A fresh 200-event run with batch sizes
+1, 50, and 200 sealed 200 events in each run.
 
 Context: the JVM-vs-Python review assumed 20k–50k events/s for `snort`. Measured durable
 ingest is two orders of magnitude below that. Any future runtime or performance decision

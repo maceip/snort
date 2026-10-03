@@ -1,15 +1,14 @@
 """BK-tree for DynaHash multi-probe lookup.
 
 Vendored from https://github.com/dimkar121/DynaHash @ 14fbaa9 (BKTree.py),
-unchanged except for the added `insert` method, which lets streaming `add`
-calls keep the multi-probe trees current (fix 4 in ../README.md).
+Adapted with streaming `insert` and iterative traversal so deep bucket trees
+do not exceed Python's recursion limit (fix 4 in ../README.md).
 """
 
 import gc
 
 
-class BKTree():
-
+class BKTree:
     def distance(self, v1, v2):
         s1 = v1.split("_")
         s2 = v2.split("_")
@@ -46,16 +45,19 @@ class BKTree():
         return True
 
     def _addLeaf(self, root, item):
-        dist = self.distance(root, item)
-        if dist > 0:
+        while True:
+            dist = self.distance(root, item)
+            if dist == 0:
+                return
             for arc in self.nodes[root]:
                 if dist == arc[1]:
-                    self._addLeaf(arc[0], item)
+                    root = arc[0]
                     break
             else:
                 if item not in self.nodes:
                     self.nodes[item] = []
                 self.nodes[root].append((item, dist))
+                return
 
     def find(self, item, threshold):
         "Return an array with all the items found with distance <= threshold from item."
@@ -65,14 +67,7 @@ class BKTree():
         return result
 
     def _finder(self, root, item, threshold, result):
-        dist = self.distance(root, item)
-        if dist <= threshold:
-            result.append(root)
-        dmin = dist - threshold
-        dmax = dist + threshold
-        for arc in self.nodes[root]:
-            if dmin <= arc[1] <= dmax:
-                self._finder(arc[0], item, threshold, result)
+        result.extend(self._xfinder(root, item, threshold))
 
     def xfind(self, item, threshold):
         "Like find, but yields items lazily. This is slower than find if you need a list."
@@ -80,12 +75,14 @@ class BKTree():
             return self._xfinder(self.root, item, threshold)
 
     def _xfinder(self, root, item, threshold):
-        dist = self.distance(root, item)
-        if dist <= threshold:
-            yield root
-        dmin = dist - threshold
-        dmax = dist + threshold
-        for arc in self.nodes[root]:
-            if dmin <= arc[1] <= dmax:
-                for node in self._xfinder(arc[0], item, threshold):
-                    yield node
+        pending = [root]
+        while pending:
+            node = pending.pop()
+            dist = self.distance(node, item)
+            if dist <= threshold:
+                yield node
+            dmin = dist - threshold
+            dmax = dist + threshold
+            pending.extend(
+                arc[0] for arc in reversed(self.nodes[node]) if dmin <= arc[1] <= dmax
+            )

@@ -27,7 +27,7 @@ snort = "snort.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["snort*"]
+include = ["snort*", "third_party.dynahash"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

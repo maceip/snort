@@ -18,7 +18,7 @@ drop the single binary anywhere and run it. it starts an embedded web dashboard 
 - hybrid text retrieval: native lance bm25 search combined with exact boolean sql filters.
 - trace grouping: reconstructs execution traces, tracks evidence, and assigns threat groups.
 - tamper-evident lineage: blake3 cryptographic hash chains protect every event, segment, and decision ledger.
-- cross-platform releases: standalone binaries for macos, linux, windows, and android.
+- cross-platform releases: standalone binaries for macos, linux, windows, and android; a separate demonstration APK.
 
 ```mermaid
 ---
@@ -210,4 +210,7 @@ prebuilt standalone binaries available on github releases:
 - `snort-linux-arm64`: linux 64-bit arm
 - `snort-windows-x64.exe`: windows 64-bit
 - `snort-android-arm64`: android command-line executable
-- `snort-android-arm64.apk`: signed android app package
+- `snort-android-arm64.apk`: signed android demonstration UI. the app is labeled
+  "snort demo" (`com.snort.demo`) and does not include the native engine, offline
+  analysis, models, rules, or telemetry datasets. use the snort cli or http service
+  for real analysis.

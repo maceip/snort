@@ -86,9 +86,25 @@ def seal_segments(
         columns: dict[str, list] = {name: [] for name in EVENT_COLUMNS}
         for event in events:
             for name in EVENT_COLUMNS:
-                value = event.get(name, "")
-                columns[name].append(value if name != "source_seq" else int(value))
-        table = pa.table({name: pa.array(columns[name]) for name in EVENT_COLUMNS})
+                value = event.get(
+                    name, 0 if name in ("source_seq", "flux_tags") else ""
+                )
+                columns[name].append(
+                    int(value or 0)
+                    if name in ("source_seq", "flux_tags")
+                    else str(value)
+                )
+        table = pa.table(
+            {
+                name: pa.array(
+                    columns[name],
+                    type=pa.int64()
+                    if name in ("source_seq", "flux_tags")
+                    else pa.string(),
+                )
+                for name in EVENT_COLUMNS
+            }
+        )
         sealed_seq += 1
         out_path = sealed_dir / _sealed_name(sealed_seq)
         lance.write_dataset(table, str(out_path), mode="overwrite")

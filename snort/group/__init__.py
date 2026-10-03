@@ -15,6 +15,8 @@ Implements plan section 4.5 (membership rules) and the version-1 subset
 - Membership states: proposed -> supported -> analyst-confirmed /
   analyst-rejected. Analyst decisions are stored as trace-group labels and
   are never expanded into pair labels.
+- Automatic memberships become unsupported when current evidence falls below
+  the assignment threshold; their history is retained without an active slot.
 """
 
 from __future__ import annotations
@@ -27,7 +29,13 @@ _PROTOTYPE_WEIGHT = 0.3
 # A shared member with strength at or above this counts for merge proposals.
 STRONG_MEMBER = 0.7
 
-VALID_STATES = ("proposed", "supported", "analyst-confirmed", "analyst-rejected")
+VALID_STATES = (
+    "proposed",
+    "supported",
+    "unsupported",
+    "analyst-confirmed",
+    "analyst-rejected",
+)
 
 
 @dataclass(frozen=True)
@@ -53,6 +61,10 @@ class Membership:
     state: str = "proposed"
     evidence: Dict = field(default_factory=dict)
     version: int = 1
+
+    @property
+    def active(self) -> bool:
+        return self.state not in ("unsupported", "analyst-rejected")
 
 
 @dataclass
@@ -137,7 +149,7 @@ class GroupManager:
         return [
             gid
             for gid, g in self.groups.items()
-            if trace_id in g.members and g.members[trace_id].state != "analyst-rejected"
+            if trace_id in g.members and g.members[trace_id].active
         ]
 
     def shared_groups(self, trace_a: str, trace_b: str) -> List[str]:
@@ -182,20 +194,40 @@ class GroupManager:
         links_by_group: Mapping[str, Sequence[ScoredLink]],
         prototype_by_group: Optional[Mapping[str, float]] = None,
     ) -> List[Membership]:
-        """Score and record memberships for one trace. Returns new memberships."""
-        scored = self.score_trace(trace_id, links_by_group, prototype_by_group)
+        """Refresh current support, retaining analyst labels and inactive history."""
+        prototype_by_group = prototype_by_group or {}
         out: List[Membership] = []
+        # Refresh existing memberships even if their new score is below tau_m.
+        # Missing/empty current evidence is not permission to keep an old score.
+        for group_id, links in links_by_group.items():
+            group = self.groups.get(group_id)
+            existing = group.members.get(trace_id) if group else None
+            if existing is None or existing.state == "analyst-rejected":
+                continue
+            strength = membership_strength(
+                [link.probability for link in links], prototype_by_group.get(group_id)
+            )
+            if existing.state != "analyst-confirmed":
+                has_slot = (
+                    existing.active
+                    or len(self.groups_of(trace_id)) < self.max_memberships
+                )
+                existing.state = (
+                    ("supported" if strength >= self.tau_seed else "proposed")
+                    if links and strength >= self.tau_m and has_slot
+                    else "unsupported"
+                )
+            existing.strength = strength
+            existing.evidence = build_membership_evidence(list(links))
+            existing.version += 1
+            group.version += 1
+            out.append(existing)
+        scored = self.score_trace(trace_id, links_by_group, prototype_by_group)
         for group_id, strength, evidence in scored:
             group = self.groups[group_id]
             existing = group.members.get(trace_id)
             if existing is not None:
-                existing.strength = strength
-                existing.evidence = evidence
-                existing.version += 1
-                if existing.state == "proposed" and strength >= self.tau_seed:
-                    existing.state = "supported"
-                group.version += 1
-                out.append(existing)
+                continue  # Already refreshed, including inactive/capped memberships.
             else:
                 if len(self.groups_of(trace_id)) >= self.max_memberships:
                     continue
@@ -233,6 +265,14 @@ class GroupManager:
         if self.shared_groups(trace_a, trace_b):
             return None
         if any(
+            all(
+                t in group.members and group.members[t].state != "analyst-rejected"
+                for t in (trace_a, trace_b)
+            )
+            for group in self.groups.values()
+        ):
+            return None  # Reactivate the historical group rather than duplicating it.
+        if any(
             len(self.groups_of(tid)) >= self.max_memberships
             for tid in (trace_a, trace_b)
         ):
@@ -263,7 +303,7 @@ class GroupManager:
         membership = group.members[trace_id]
         if (
             decision == "analyst-confirmed"
-            and membership.state == "analyst-rejected"
+            and not membership.active
             and len(self.groups_of(trace_id)) >= self.max_memberships
         ):
             raise ValueError("trace already has the maximum active memberships")
@@ -290,6 +330,8 @@ class GroupManager:
                     tid
                     for tid, m in self.groups[gid_a].members.items()
                     if tid in self.groups[gid_b].members
+                    and m.active
+                    and self.groups[gid_b].members[tid].active
                     and m.strength >= STRONG_MEMBER
                     and self.groups[gid_b].members[tid].strength >= STRONG_MEMBER
                 ]
@@ -300,10 +342,12 @@ class GroupManager:
     def group_timeline(
         self, group_id: str, trace_spans: Mapping[str, Tuple[float, float]]
     ) -> List[Tuple[str, float, float]]:
-        """Timeline across all members: ``[(trace_id, start, end)]`` sorted by start."""
+        """Timeline across active members, sorted by start."""
         group = self.groups[group_id]
         spans = [
-            (tid, *trace_spans[tid]) for tid in group.members if tid in trace_spans
+            (tid, *trace_spans[tid])
+            for tid, member in group.members.items()
+            if member.active and tid in trace_spans
         ]
         spans.sort(key=lambda item: (item[1], item[0]))
         return spans
