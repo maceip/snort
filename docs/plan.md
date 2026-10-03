@@ -52,7 +52,9 @@ are detailed in the [ingest, query, and grouping architecture](architecture.md).
 ```mermaid
 flowchart LR
     subgraph S1["Stage 1: Ingest & Store"]
-        RAW[Raw Telemetry] --> WAL[(BLAKE3 WAL)]
+        RAW["Raw Telemetry (/ingest)"] --> WAL[(BLAKE3 WAL)]
+        OTEL["OTLP Traces & Logs<br/>(/v1/traces, /v1/logs)"] --> OTLP_ADP["snort.ingest.otlp<br/>(session_id = trace_id)"]
+        OTLP_ADP --> WAL
         WAL --> SEAL[(Sealed Lance Datasets)]
         SEAL --> SRCH[DuckDB Lance Extension + Native Indexes]
     end

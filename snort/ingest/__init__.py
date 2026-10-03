@@ -8,6 +8,7 @@ from snort.ingest.events import (
     normalize_event,
     template_hash,
 )
+from snort.ingest.otlp import parse_otlp_logs, parse_otlp_traces
 from snort.ingest.readers import iter_cta_json, iter_e3_jsonl, iter_jsonl
 from snort.ingest.wal import WalReader, WalWriter, verify_wal_chain
 
@@ -18,6 +19,8 @@ __all__ = [
     "hash_bytes",
     "normalize_event",
     "template_hash",
+    "parse_otlp_traces",
+    "parse_otlp_logs",
     "iter_cta_json",
     "iter_e3_jsonl",
     "iter_jsonl",

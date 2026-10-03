@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import sys
+import urllib.parse
 from pathlib import Path
 
 
@@ -424,6 +425,242 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _fetch_telemetry(args: argparse.Namespace, path: str, store_fn):
+    server = getattr(args, "server", None)
+    if server:
+        import urllib.request
+
+        url = server.rstrip("/") + path
+        try:
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"failed to query snort server at {url}: {exc}") from exc
+    from snort.server import SnortStoreManager
+
+    data_dir = getattr(args, "data_dir", "./snort_data")
+    with SnortStoreManager(data_dir) as store:
+        return store_fn(store)
+
+
+def _cmd_traces(args: argparse.Namespace) -> int:
+    params = []
+    if getattr(args, "service", None):
+        params.append(f"service={urllib.parse.quote(args.service)}")
+    if getattr(args, "status", None):
+        params.append(f"status={urllib.parse.quote(args.status)}")
+    if getattr(args, "limit", None):
+        params.append(f"limit={args.limit}")
+    qs = ("?" + "&".join(params)) if params else ""
+
+    traces = _fetch_telemetry(
+        args,
+        f"/api/traces{qs}",
+        lambda store: store.get_traces_summary(
+            service=getattr(args, "service", None),
+            status=getattr(args, "status", None),
+            limit=getattr(args, "limit", 50),
+        ),
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(traces, indent=2))
+        return 0
+
+    if not traces:
+        print("no traces found.")
+        return 0
+
+    header = f"{'TRACE ID':<36} {'SERVICE':<18} {'ROOT OPERATION':<26} {'DURATION':<11} {'SPANS':<6} {'STATUS':<7} {'START TIME'}"
+    print(header)
+    print("-" * len(header))
+    for t in traces:
+        tid = str(t.get("trace_id", ""))
+        svc = str(t.get("service", ""))[:17]
+        op = str(t.get("root_operation", ""))[:25]
+        dur = f"{t.get('duration_ms', 0):.2f}ms"
+        spans = str(t.get("span_count", 1))
+        st = str(t.get("status", "ok")).upper()
+        ts = str(t.get("start_ts", ""))[:19]
+        print(f"{tid:<36} {svc:<18} {op:<26} {dur:<11} {spans:<6} {st:<7} {ts}")
+    return 0
+
+
+def _cmd_spans(args: argparse.Namespace) -> int:
+    target_id = getattr(args, "trace_id", None) or getattr(args, "span_id", None)
+    if not target_id:
+        return _cmd_traces(args)
+
+    tree = _fetch_telemetry(
+        args,
+        f"/api/traces/{urllib.parse.quote(target_id)}",
+        lambda store: store.get_trace_tree(target_id),
+    )
+    if tree and tree.get("spans"):
+        if getattr(args, "json", False):
+            print(json.dumps(tree, indent=2))
+            return 0
+        print(
+            f"TRACE: {tree['trace_id']} (service: {tree['service']}, duration: {tree['duration_ms']:.2f}ms, spans: {tree['span_count']}, status: {tree['status'].upper()})"
+        )
+        for s in tree["spans"]:
+            indent = "   " * s.get("depth", 0)
+            prefix = "├─ " if s.get("depth", 0) > 0 else ""
+            ai_info = ""
+            if s.get("is_ai_call"):
+                m = s.get("attributes", {}).get("ai_model", "")
+                tok = s.get("attributes", {}).get("ai_total_tokens", 0)
+                ai_info = f" [AI: {m} | {tok} tokens]"
+            print(
+                f"{indent}{prefix}[{s.get('offset_ms', 0):.2f}ms] {s.get('name')} ({s.get('service')}) {s.get('duration_ms', 0):.2f}ms [{s.get('status', 'ok').upper()}]{ai_info}"
+            )
+        return 0
+
+    span = _fetch_telemetry(
+        args,
+        f"/api/spans/{urllib.parse.quote(target_id)}",
+        lambda store: store.get_span(target_id),
+    )
+    if span:
+        if getattr(args, "json", False):
+            print(json.dumps(span, indent=2))
+            return 0
+        attrs = span.get("attributes", {})
+        print(
+            f"SPAN: {attrs.get('span_id', target_id)} ({attrs.get('service_name', span.get('source_id'))})"
+        )
+        print(f"Operation : {span.get('action')}")
+        print(f"Duration  : {attrs.get('duration_ms', 0):.2f}ms")
+        print(f"Status    : {attrs.get('status', 'ok').upper()}")
+        print(f"Trace ID  : {attrs.get('trace_id') or span.get('session_id')}")
+        print(f"Timestamp : {span.get('ts')}")
+        print("\nAttributes:")
+        for k, v in sorted(attrs.items()):
+            if k not in ("events", "_snort_ingest"):
+                print(f"  {k}: {v}")
+        logs = span.get("correlated_logs", [])
+        if logs:
+            print(f"\nCorrelated Logs ({len(logs)}):")
+            for l in logs:
+                print(f"  [{l.get('ts')}] {l.get('raw')}")
+        return 0
+
+    print(f"Span or trace '{target_id}' not found.", file=sys.stderr)
+    return 1
+
+
+def _cmd_logs(args: argparse.Namespace) -> int:
+    params = []
+    if getattr(args, "service", None):
+        params.append(f"service={urllib.parse.quote(args.service)}")
+    if getattr(args, "trace_id", None):
+        params.append(f"trace_id={urllib.parse.quote(args.trace_id)}")
+    if getattr(args, "span_id", None):
+        params.append(f"span_id={urllib.parse.quote(args.span_id)}")
+    if getattr(args, "severity", None):
+        params.append(f"severity={urllib.parse.quote(args.severity)}")
+    if getattr(args, "limit", None):
+        params.append(f"limit={args.limit}")
+    qs = ("?" + "&".join(params)) if params else ""
+
+    logs = _fetch_telemetry(
+        args,
+        f"/api/logs{qs}",
+        lambda store: store.get_logs(
+            service=getattr(args, "service", None),
+            trace_id=getattr(args, "trace_id", None),
+            span_id=getattr(args, "span_id", None),
+            severity=getattr(args, "severity", None),
+            limit=getattr(args, "limit", 50),
+        ),
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(logs, indent=2))
+        return 0
+
+    if not logs:
+        print("no logs found.")
+        return 0
+
+    for l in logs:
+        ts = str(l.get("ts", ""))[:19]
+        sev = str(l.get("severity", "INFO")).upper()
+        svc = l.get("service", "unknown")
+        msg = l.get("message", "")
+        tid = l.get("trace_id", "")
+        context = f" (trace: {tid[:12]}...)" if tid else ""
+        print(f"[{ts}] [{sev:<5}] {svc}: {msg}{context}")
+    return 0
+
+
+def _cmd_services(args: argparse.Namespace) -> int:
+    services = _fetch_telemetry(
+        args,
+        "/api/services",
+        lambda store: store.get_services(),
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(services, indent=2))
+        return 0
+
+    if not services:
+        print("no services found.")
+        return 0
+
+    header = f"{'SERVICE':<28} {'EVENTS':<10} {'ERRORS':<10} {'AI CALLS'}"
+    print(header)
+    print("-" * len(header))
+    for s in services:
+        print(
+            f"{s.get('name', ''):<28} {s.get('events', 0):<10} {s.get('errors', 0):<10} {s.get('ai_calls', 0)}"
+        )
+    return 0
+
+
+def _cmd_ai(args: argparse.Namespace) -> int:
+    params = []
+    if getattr(args, "service", None):
+        params.append(f"service={urllib.parse.quote(args.service)}")
+    if getattr(args, "model", None):
+        params.append(f"model={urllib.parse.quote(args.model)}")
+    if getattr(args, "limit", None):
+        params.append(f"limit={args.limit}")
+    qs = ("?" + "&".join(params)) if params else ""
+
+    calls = _fetch_telemetry(
+        args,
+        f"/api/ai/calls{qs}",
+        lambda store: store.get_ai_calls(
+            limit=getattr(args, "limit", 20),
+            service=getattr(args, "service", None),
+            model=getattr(args, "model", None),
+        ),
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(calls, indent=2))
+        return 0
+
+    if not calls:
+        print("no AI calls found.")
+        return 0
+
+    header = f"{'TIMESTAMP':<19} {'SERVICE':<14} {'PROVIDER':<12} {'MODEL':<20} {'DURATION':<10} {'TOKENS (IN/OUT/TOT)':<22} {'PROMPT PREVIEW'}"
+    print(header)
+    print("-" * len(header))
+    for c in calls:
+        ts = str(c.get("timestamp", ""))[:19]
+        svc = str(c.get("service", ""))[:13]
+        prov = str(c.get("provider", ""))[:11]
+        mdl = str(c.get("model", ""))[:19]
+        dur = f"{c.get('duration_ms', 0):.1f}ms"
+        tokens = f"{c.get('input_tokens',0)}/{c.get('output_tokens',0)} ({c.get('total_tokens',0)})"
+        prompt = str(c.get("prompt_preview", ""))[:35]
+        print(
+            f"{ts:<19} {svc:<14} {prov:<12} {mdl:<20} {dur:<10} {tokens:<22} {prompt}"
+        )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="snort",
@@ -536,11 +773,100 @@ def build_parser() -> argparse.ArgumentParser:
     query.add_argument("--data-dir", default="./snort_data")
     query.add_argument("--limit", type=int, default=1000)
     query.set_defaults(func=_cmd_query)
-    for name in ("groups", "traces"):
-        command = sub.add_parser(name, help="inspect persisted " + name)
-        command.add_argument("--data-dir", default="./snort_data")
-        command.add_argument("--limit", type=int, default=1000)
-        command.set_defaults(func=_cmd_query)
+    groups = sub.add_parser("groups", help="inspect persisted threat groups")
+    groups.add_argument("--data-dir", default="./snort_data")
+    groups.add_argument("--limit", type=int, default=1000)
+    groups.set_defaults(func=_cmd_query)
+
+    traces = sub.add_parser("traces", help="inspect assembled traces (live or historical)")
+    traces.add_argument("--service", default=None, help="filter by service name")
+    traces.add_argument(
+        "--status", default=None, choices=["ok", "error"], help="filter by status"
+    )
+    traces.add_argument(
+        "--limit", type=int, default=50, help="max traces (default: 50)"
+    )
+    traces.add_argument(
+        "--data-dir", default="./snort_data", help="storage directory"
+    )
+    traces.add_argument(
+        "--server", default=None, help="query running snort server URL"
+    )
+    traces.add_argument("--json", action="store_true", help="output JSON array")
+    traces.set_defaults(func=_cmd_traces)
+
+    spans = sub.add_parser(
+        "spans", help="inspect spans and render trace waterfall trees"
+    )
+    spans.add_argument(
+        "span_id", nargs="?", default=None, help="span ID or trace ID to inspect"
+    )
+    spans.add_argument(
+        "--trace-id", default=None, help="trace ID to render as an ASCII waterfall tree"
+    )
+    spans.add_argument("--limit", type=int, default=100, help="max spans limit")
+    spans.add_argument(
+        "--data-dir", default="./snort_data", help="storage directory"
+    )
+    spans.add_argument(
+        "--server", default=None, help="query running snort server URL"
+    )
+    spans.add_argument("--json", action="store_true", help="output JSON")
+    spans.set_defaults(func=_cmd_spans)
+
+    logs = sub.add_parser(
+        "logs", help="query and stream correlated telemetry logs"
+    )
+    logs.add_argument("--service", default=None, help="filter by service")
+    logs.add_argument(
+        "--trace-id", default=None, help="filter by correlated trace ID"
+    )
+    logs.add_argument(
+        "--span-id", default=None, help="filter by correlated span ID"
+    )
+    logs.add_argument(
+        "--severity", default=None, help="filter by severity (e.g. ERROR, WARN, INFO)"
+    )
+    logs.add_argument(
+        "--limit", type=int, default=50, help="max logs limit (default: 50)"
+    )
+    logs.add_argument(
+        "--data-dir", default="./snort_data", help="storage directory"
+    )
+    logs.add_argument(
+        "--server", default=None, help="query running snort server URL"
+    )
+    logs.add_argument("--json", action="store_true", help="output JSON")
+    logs.set_defaults(func=_cmd_logs)
+
+    services = sub.add_parser(
+        "services", help="list active services reporting telemetry"
+    )
+    services.add_argument(
+        "--data-dir", default="./snort_data", help="storage directory"
+    )
+    services.add_argument(
+        "--server", default=None, help="query running snort server URL"
+    )
+    services.add_argument("--json", action="store_true", help="output JSON")
+    services.set_defaults(func=_cmd_services)
+
+    ai = sub.add_parser(
+        "ai", help="inspect detected AI SDK / LLM calls and token metrics"
+    )
+    ai.add_argument("--service", default=None, help="filter by service")
+    ai.add_argument("--model", default=None, help="filter by model name")
+    ai.add_argument(
+        "--limit", type=int, default=20, help="max AI calls limit (default: 20)"
+    )
+    ai.add_argument(
+        "--data-dir", default="./snort_data", help="storage directory"
+    )
+    ai.add_argument(
+        "--server", default=None, help="query running snort server URL"
+    )
+    ai.add_argument("--json", action="store_true", help="output JSON")
+    ai.set_defaults(func=_cmd_ai)
 
     return parser
 

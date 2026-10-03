@@ -10,7 +10,9 @@ drop the single binary anywhere and run it. it starts an embedded web dashboard 
 
 - drop-and-run binary: single file executable with zero external dependencies.
 - network ingest sink: post json or jsonl events over http with durable write-ahead logging.
-- embedded web dashboard: live search bar, real-time store statistics, trace viewer, and drag-and-drop ingest.
+- opentelemetry support: native OTLP/HTTP trace (`/v1/traces`) and log (`/v1/logs`) ingest compatible with motel, effect, and standard otel exporters.
+- embedded web dashboard: live search bar, trace waterfall viewer, ai call inspector, real-time store statistics, and drag-and-drop ingest.
+- native cli commands: instant terminal inspection of traces, spans (with ASCII waterfall trees), logs, services, and ai call metrics without a heavy tui.
 - columnar storage: wal segments seal into immutable lance files with native duckdb vector and full-scan support.
 - unified search: duckdb queries sealed lance files and the unsealed wal tail simultaneously in a single pass.
 - hybrid text retrieval: native lance bm25 search combined with exact boolean sql filters.
@@ -29,30 +31,52 @@ config:
 ---
 flowchart TB
 
-    SRC["Telemetry / Dataset Sources"]
-    Q["Incoming Queries"]
+    subgraph INGEST["Ingest Sinks & Readers"]
+        OTEL_T["OTLP Traces (/v1/traces)"]
+        OTEL_L["OTLP Logs (/v1/logs)"]
+        RAW_JSON["HTTP Sink (/ingest)"]
+        READ["File Readers (CTA / E3 / JSONL)"]
+    end
 
-    SRC --> READ["Readers"]
-    READ --> WAL["BLAKE3 WAL"]
-    WAL --> BUF["In-Memory Buffer"]
+    subgraph NORM["Normalization & Bridging"]
+        OTLP_ADP["snort.ingest.otlp<br/>(Trace/Span/Log Normalizer + AI Metadata)"]
+        ANCHOR["session_id = trace_id"]
+    end
 
-    Q --> TEXT["Free-text / Keywords"]
-    Q --> SQL["Structured / Analytics"]
+    subgraph STORAGE["Storage Subsystems"]
+        WAL["BLAKE3 WAL"]
+        BUF["In-Memory Buffer"]
+        LANCE["Lance Datasets (.lance)"]
+        INDEX["Native Indexes<br/>BM25 Full-Text · BTREE · Vector"]
+    end
 
-    TEXT --> SDK["Lance Native SDK"]
-    SQL --> DUCK["DuckDB"]
+    subgraph ENGINE["Query & Processing Engine"]
+        DUCK["DuckDB Unified Engine"]
+        RUNTIME["Live Runtime & Trace Assembler"]
+        LEDGER[("BLAKE3 Decision Ledger")]
+    end
 
-    BUF -->|"seal / append"| LANCE["Lance Dataset"]
-    SDK --> LANCE
-    DUCK --> BUF
-    DUCK --> LANCE
+    subgraph INTERFACES["Web & CLI Interfaces"]
+        DASH["Embedded Web Dashboard<br/>Trace Waterfall · AI Inspector · SQL"]
+        CLI["Native CLI & JSON API<br/>traces · spans · logs · ai · services"]
+    end
 
-    LANCE --> INDEX["Native Indexes
-    BTREE · Full-Text · Vector"]
+    OTEL_T & OTEL_L --> OTLP_ADP
+    OTLP_ADP --> ANCHOR
+    ANCHOR & RAW_JSON & READ --> WAL
+    WAL --> BUF
+    BUF -->|"seal / roll"| LANCE
+    LANCE --> INDEX
+    WAL & LANCE --> DUCK
+    WAL & DUCK --> RUNTIME
+    RUNTIME --> LEDGER
+    RUNTIME & DUCK --> DASH
+    RUNTIME & DUCK --> CLI
 
     classDef focus stroke-width:3px
-    class LANCE focus
+    class LANCE,WAL,RUNTIME focus
 ```
+
 ## quick start
 
 ### 1. start the engine
@@ -73,18 +97,51 @@ open your browser at `http://127.0.0.1:8080` to access the dashboard.
 
 ### 2. stream telemetry into the sink
 
-pipe json or jsonl lines directly to the ingest endpoint using curl, fluentbit, or any agent:
+#### a. OpenTelemetry (OTLP/HTTP)
+point your app's OTLP exporters directly at snort:
 
 ```bash
-curl -x post http://127.0.0.1:8080/ingest \
-  -h "content-type: application/json" \
+export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT="http://127.0.0.1:8080/v1/traces"
+export OTEL_EXPORTER_OTLP_LOGS_ENDPOINT="http://127.0.0.1:8080/v1/logs"
+```
+
+#### b. Raw JSON or JSONL lines
+pipe json lines directly to the ingest endpoint using curl, fluentbit, or any agent:
+
+```bash
+curl -X POST http://127.0.0.1:8080/ingest \
+  -H "Content-Type: application/json" \
   -d '[
-    {"ts": "2024-01-01t12:00:00z", "host": "web-srv", "action": "exec", "raw": "powershell -enc test1234"},
-    {"ts": "2024-01-01t12:01:00z", "host": "web-srv", "action": "connect", "raw": "nginx connect 10.10.10.1"}
+    {"ts": "2024-01-01T12:00:00Z", "host": "web-srv", "action": "exec", "raw": "powershell -enc test1234"},
+    {"ts": "2024-01-01T12:01:00Z", "host": "web-srv", "action": "connect", "raw": "nginx connect 10.10.10.1"}
   ]'
 ```
 
-### 3. search events
+### 3. terminal inspection (cli & ai agents)
+
+query assembled traces, render ASCII waterfall trees, stream logs, and inspect ai calls without a heavy tui:
+
+```bash
+# list recent traces
+snort traces --limit 20
+
+# render an ASCII waterfall tree for a specific trace
+snort spans --trace-id 4bf92f3577b34da6a3ce929d0e0e4736
+
+# inspect span details & correlated logs
+snort spans 5fb397be34d23b0f
+
+# stream logs
+snort logs --severity ERROR
+
+# inspect AI SDK / LLM calls & token metrics
+snort ai
+
+# list reporting services
+snort services
+```
+
+### 4. search events
 
 search across live wal and sealed lance segments via the web ui or rest api:
 
